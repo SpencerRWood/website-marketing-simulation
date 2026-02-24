@@ -16,9 +16,16 @@ class RunConfig:
 
 
 @dataclass(frozen=True)
+class FlushConfig:
+    every_n_events: int = 5000
+    or_every_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
 class StorageConfig:
     duckdb_path: str
     clean_slate: bool = True
+    flush: FlushConfig = FlushConfig()
 
 
 @dataclass(frozen=True)
