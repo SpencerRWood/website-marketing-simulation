@@ -10,7 +10,7 @@ import simpy
 from sim.core.config import SimulationConfig
 from sim.core.ids import deterministic_run_id_from_config
 from sim.core.logging import get_logger
-from sim.core.rng import SeededRNG
+from sim.core.rng import RNG
 from sim.core.types import RunContext
 
 EVENTS_DDL = """
@@ -73,7 +73,7 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
         run_id = cfg.run.run_id
 
     logger = get_logger("sim", cfg.logging.level)
-    rng = SeededRNG(cfg.run.seed)
+    rng = RNG(cfg.run.seed)
 
     # authoritative UTC start time derived from config start_date at midnight UTC
     start_dt_utc = datetime.fromisoformat(cfg.run.start_date).replace(tzinfo=UTC)
