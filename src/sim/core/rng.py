@@ -9,7 +9,7 @@ T = TypeVar("T")
 
 
 @dataclass
-class SeededRNG:
+class RNG:
     seed: int
 
     def __post_init__(self) -> None:
@@ -25,6 +25,9 @@ class SeededRNG:
         return self._r.choice(seq)
 
     def choices(
-        self, population: Sequence[T], weights: Sequence[float] | None = None, k: int = 1
+        self,
+        population: Sequence[T],
+        weights: Sequence[float] | None = None,
+        k: int = 1,
     ) -> list[T]:
         return self._r.choices(population, weights=weights, k=k)

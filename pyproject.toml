@@ -25,7 +25,7 @@ quote-style = "double"
 [tool.pytest.ini_options]
 minversion = "8.0"
 addopts = "-q"
-testpaths = ["tests"]
+testpaths = ["src", "tests"]
 pythonpath = ["src"]
 
 [dependency-groups]
