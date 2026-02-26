@@ -10,3 +10,24 @@ storage:
 
 logging:
   level: "INFO"
+
+users:
+  new_user_share: 0.6
+
+  selection:
+    mode: "recency_propensity_weighted"
+    recency_half_life_hours: 18
+    propensity_weight: 0.5
+    recency_weight: 0.5
+
+  propensity:
+    init:
+      dist: "beta"
+      alpha: 2.0
+      beta: 6.0
+
+  discovery_mode:
+    enabled: true
+    graduation_sessions: 2
+    dropoff_multiplier: 1.25
+    conversion_logit_shift: -0.8
