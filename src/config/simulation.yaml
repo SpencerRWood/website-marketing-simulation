@@ -1,33 +1,136 @@
+# ============================================================
+# Simulation Runtime Configuration
+# ============================================================
+
 run:
-  run_id: "auto"
-  seed: 123
-  start_date: "2026-01-01"
-  num_days: 30
+  run_id: "auto"           # If "auto", generated at runtime. Attached to all outputs.
+  seed: 123                # Master RNG seed (guarantees deterministic runs).
+  start_date: "2026-01-01" # Simulation start date (UTC).
+  num_days: 30             # Number of simulated calendar days.
+
+
+# ============================================================
+# Storage (Cold Layer)
+# ============================================================
 
 storage:
-  duckdb_path: "data/sim.duckdb"
-  clean_slate: true
+  duckdb_path: "data/sim.duckdb"  # Cold storage sink.
+  clean_slate: true               # If true, database is recreated per run.
+
+
+# ============================================================
+# Logging
+# ============================================================
 
 logging:
-  level: "INFO"
+  level: "INFO"  # Structured logging level.
+
+
+# ============================================================
+# Users (Hot Layer Behavioral Engine)
+# ============================================================
 
 users:
-  new_user_share: 0.6
 
+  # Probability that a new intent creates a brand-new user.
+  # If users already exist:
+  #   With probability new_user_share → create new user.
+  #   Otherwise → select an existing user via weighted sampling.
+  new_user_share: 0.85
+
+
+  # ----------------------------------------------------------
+  # Returning User Selection Model
+  # ----------------------------------------------------------
   selection:
+
+    # Currently supported mode:
+    # "recency_propensity_weighted"
+    #
+    # Weight formula:
+    #
+    #   weight_i =
+    #       recency_weight * recency_score_i
+    #     + propensity_weight * propensity_i
+    #
+    # where:
+    #   recency_score_i = exp(-ln(2) * age_hours / half_life)
+    #
+    # So:
+    #   age = half_life → score = 0.5
+    #   age = 2*half_life → score = 0.25
+    #
     mode: "recency_propensity_weighted"
+
+    # Half-life (in hours) for recency decay.
+    # Controls how quickly inactive users become unlikely to return.
+    #
+    # Smaller → faster decay (more short-term clustering)
+    # Larger  → longer memory (more persistent users)
     recency_half_life_hours: 18
+
+    # Weight assigned to latent user propensity (0–1).
+    # Higher → high-intent users dominate returning traffic.
     propensity_weight: 0.5
+
+    # Weight assigned to recency score.
+    # Higher → recently active users dominate.
     recency_weight: 0.5
 
+
+  # ----------------------------------------------------------
+  # Latent Propensity Distribution (User Heterogeneity)
+  # ----------------------------------------------------------
   propensity:
     init:
+
+      # Distribution used when creating a new user.
+      #
+      # "uniform" → U(0,1)
+      # "beta"    → Beta(alpha, beta)
+      #
+      # Beta is recommended for realistic skewed populations.
       dist: "beta"
+
+      # Beta(alpha, beta) parameters.
+      #
+      # Mean = alpha / (alpha + beta)
+      #
+      # (2,6) → mean ≈ 0.25
+      #          Most users low intent,
+      #          small tail of high-intent users.
+      #
+      # Increasing alpha shifts population toward high intent.
+      # Increasing beta shifts population toward low intent.
       alpha: 2.0
       beta: 6.0
 
+
+  # ----------------------------------------------------------
+  # Discovery Mode (New User State)
+  # ----------------------------------------------------------
   discovery_mode:
+
+    # If enabled:
+    #   All new users start in discovery mode.
+    #   Discovery state modifies downstream session behavior.
     enabled: true
+
+    # Number of completed sessions before user graduates
+    # from discovery mode to normal state.
     graduation_sessions: 2
+
+    # Multiplier applied to page drop-off probability
+    # while in discovery mode.
+    #
+    # >1.0 → higher drop-off (less engaged new users)
+    # <1.0 → lower drop-off (sticky onboarding)
     dropoff_multiplier: 1.25
+
+    # Additive shift applied to conversion logit:
+    #
+    #   logit(p) += conversion_logit_shift
+    #
+    # Negative → lower early conversion
+    # Positive → onboarding boost
     conversion_logit_shift: -0.8
