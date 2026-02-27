@@ -134,3 +134,6 @@ users:
     # Negative → lower early conversion
     # Positive → onboarding boost
     conversion_logit_shift: -0.8
+
+# session_intent:
+#   queue_capacity: null   # null = unbounded, or set an int like 100000
