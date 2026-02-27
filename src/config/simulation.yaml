@@ -137,3 +137,6 @@ users:
 
 # session_intent:
 #   queue_capacity: null   # null = unbounded, or set an int like 100000
+
+intent_resolver:
+  enabled: true

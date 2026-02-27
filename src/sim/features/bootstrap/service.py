@@ -6,12 +6,16 @@ from datetime import UTC, datetime, timedelta
 import simpy
 
 from sim.core.config import SimulationConfig
-from sim.core.ids import deterministic_run_id_from_config
+from sim.core.ids import IdsService, deterministic_run_id_from_config
 from sim.core.logging import get_logger
 from sim.core.rng import RNG
 from sim.core.types import RunContext
+from sim.features.intent_resolver.service import IntentResolverService
+from sim.features.intent_resolver.types import IntentResolverConfig
 from sim.features.persistence.duckdb_adapter import DuckDBAdapter
 from sim.features.persistence.service import Event, PersistenceService
+from sim.features.session_intent.service import SessionIntentService
+from sim.features.users_state.service import UsersConfig, UsersStateService
 
 
 @dataclass(frozen=True)
@@ -21,22 +25,26 @@ class BootstrapResult:
 
 
 def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> BootstrapResult:
+    # ----- run identity -----
     if cfg.run.run_id == "auto":
         run_id = deterministic_run_id_from_config(cfg.raw)
     else:
         run_id = cfg.run.run_id
 
     logger = get_logger("sim", cfg.logging.level)
+
+    # Single seeded RNG (no global random)
     rng = RNG(cfg.run.seed)
+
+    # Single IDs service (shared across features)
+    ids = IdsService(run_id=run_id)
 
     start_dt_utc = datetime.fromisoformat(cfg.run.start_date).replace(tzinfo=UTC)
     ctx = RunContext(run_id=run_id, seed=cfg.run.seed, start_dt_utc=start_dt_utc)
 
-    def eid(n: int) -> str:
-        return f"evt_{n:08d}"
-
     env = simpy.Environment()
 
+    # ----- cold storage -----
     adapter = DuckDBAdapter(
         path=cfg.storage.duckdb_path,
         clean_slate=cfg.storage.clean_slate,
@@ -46,10 +54,129 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
         every_n_events=cfg.storage.flush.every_n_events,
         or_every_seconds=cfg.storage.flush.or_every_seconds,
     )
-
     persistence.open()
     persistence.start_periodic_flush(env)
 
+    # ----- minimal sink adapter (resolver/session -> persistence) -----
+    class PersistenceEventSink:
+        def __init__(
+            self, *, ctx: RunContext, ids: IdsService, persistence: PersistenceService
+        ) -> None:
+            self._ctx = ctx
+            self._ids = ids
+            self._p = persistence
+
+        def emit(
+            self,
+            *,
+            ts_utc: datetime,
+            sim_time_s: float,
+            event_type: str,
+            user_id: str | None = None,
+            session_id: str | None = None,
+            intent_id: str | None = None,
+            intent_source: str | None = None,
+            channel: str | None = None,
+            audience_id: str | None = None,
+            payload: dict | None = None,
+        ) -> None:
+            self._p.emit(
+                Event(
+                    run_id=self._ctx.run_id,
+                    event_id=self._ids.next_id("evt"),
+                    ts_utc=ts_utc,
+                    sim_time_s=sim_time_s,
+                    event_type=event_type,
+                    user_id=user_id,
+                    session_id=session_id,
+                    intent_source=intent_source,
+                    channel=channel,
+                )
+            )
+
+    sink = PersistenceEventSink(ctx=ctx, ids=ids, persistence=persistence)
+
+    # ----------------------------------------------------------------------------------
+    # IMPORTANT: Keep bootstrap "minimal by default".
+    # The bootstrap tests expect only run_started + run_finished in the events table
+    # unless the config explicitly enables simulation activity.
+    # ----------------------------------------------------------------------------------
+    raw = cfg.raw if isinstance(cfg.raw, dict) else {}
+    has_users = "users" in raw
+    has_intent_resolver = "intent_resolver" in raw
+    has_baseline_intents = "baseline_intents" in raw
+
+    enable_activity = has_users or has_intent_resolver or has_baseline_intents
+
+    if enable_activity:
+        # ----- session-intent bus -----
+        session_intents = SessionIntentService(env=env, ids=ids, capacity=None)
+
+        # ----- users hot state (REAL) -----
+        users_cfg = getattr(cfg, "users", None)
+        if users_cfg is None:
+            users_cfg = UsersConfig()
+        users = UsersStateService(cfg=users_cfg)
+
+        # ----- downstream session runner (stub until feat/sessions) -----
+        class NoopSessionRunner:
+            def __init__(
+                self, env: simpy.Environment, sink: PersistenceEventSink, users: UsersStateService
+            ) -> None:
+                self._env = env
+                self._sink = sink
+                self._users = users
+
+            def start_session(
+                self, *, user_id: str, session_id: str, intent
+            ) -> simpy.events.Process:
+                return self._env.process(
+                    self._run(user_id=user_id, session_id=session_id, intent=intent)
+                )
+
+            def _run(self, *, user_id: str, session_id: str, intent):
+                now_utc = intent.ts_utc
+                self._sink.emit(
+                    ts_utc=now_utc,
+                    sim_time_s=float(self._env.now),
+                    event_type="session_end",
+                    user_id=user_id,
+                    session_id=session_id,
+                    intent_source=intent.intent_source,
+                    channel=intent.channel,
+                )
+                self._users.mark_session_end(user_id=user_id, now_utc=now_utc)
+                yield self._env.timeout(0)
+
+        session_runner = NoopSessionRunner(env=env, sink=sink, users=users)
+
+        # ----- intent resolver -----
+        resolver_cfg = IntentResolverConfig(
+            enabled=getattr(getattr(cfg, "intent_resolver", None), "enabled", True)
+        )
+        resolver = IntentResolverService(
+            env=env,
+            cfg=resolver_cfg,
+            ids=ids,
+            rng=rng,
+            intents=session_intents,
+            users=users,
+            session_runner=session_runner,
+            sink=sink,
+        )
+        resolver.start()
+
+        # ----- baseline intent producer (only when activity enabled) -----
+        def baseline_intent_driver():
+            step_s = 3600.0  # placeholder: 1 intent/hour
+            while True:
+                ts = start_dt_utc + timedelta(seconds=float(env.now))
+                session_intents.publish_new(ts_utc=ts, intent_source="baseline")
+                yield env.timeout(step_s)
+
+        env.process(baseline_intent_driver())
+
+    # ----- run lifecycle -----
     try:
         logger.info(
             "bootstrap_start",
@@ -58,7 +185,7 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
         persistence.emit(
             Event(
                 run_id=ctx.run_id,
-                event_id=eid(1),
+                event_id=ids.next_id("evt"),
                 ts_utc=start_dt_utc,
                 sim_time_s=float(env.now),
                 event_type="run_started",
@@ -73,7 +200,7 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
         persistence.emit(
             Event(
                 run_id=ctx.run_id,
-                event_id=eid(2),
+                event_id=ids.next_id("evt"),
                 ts_utc=end_ts,
                 sim_time_s=float(env.now),
                 event_type="run_finished",
@@ -83,8 +210,11 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
             "bootstrap_finish",
             extra={"run_id": ctx.run_id, "feature": "bootstrap", "event_type": "run_finished"},
         )
+
+        # Ensure run_finished isn't stranded
+        persistence.flush(reason="bootstrap_finish")
+
     finally:
         persistence.close()
 
-    _ = rng
     return BootstrapResult(ctx=ctx, duckdb_path=cfg.storage.duckdb_path)
