@@ -140,3 +140,26 @@ users:
 
 intent_resolver:
   enabled: true
+
+# ============================================================
+# Sessions
+# ============================================================
+
+sessions:
+  # Session ends if the user is inactive for this long between page views.
+  inactivity_timeout_minutes: 30
+
+  # Hard cap on number of pages visited in a session.
+  max_steps: null
+
+  # Entry page for all sessions (unless overridden by caller).
+  entry_page: "home"
+
+  # Time between page views (user reading / navigating)
+  inter_page_time:
+    # Options: fixed | exponential
+    dist: "exponential"
+    fixed_seconds: 10.0
+
+    # Only used if dist == exponential
+    mean_seconds: 10.0
