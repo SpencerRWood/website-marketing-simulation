@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -24,16 +24,10 @@ def deterministic_run_id_from_config(cfg_raw: dict[str, Any], length: int = 12) 
 
 @dataclass(slots=True)
 class IdsService:
-    """
-    Deterministic, run-scoped ID generator.
-    """
-
     run_id: str
-
-    def __post_init__(self) -> None:
-        self._counters: dict[str, int] = {}
+    _counters: dict[str, int] = field(default_factory=dict, init=False, repr=False)
 
     def next_id(self, prefix: str) -> str:
         n = self._counters.get(prefix, 0) + 1
         self._counters[prefix] = n
-        return f"{prefix}_{n:06d}"
+        return f"{prefix}_{self.run_id}_{n:08d}"
