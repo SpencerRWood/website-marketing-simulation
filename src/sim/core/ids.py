@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -19,3 +20,20 @@ def deterministic_run_id_from_config(cfg_raw: dict[str, Any], length: int = 12) 
     s = canonical_json(cfg_raw).encode("utf-8")
     h = hashlib.sha1(s).hexdigest()
     return h[:length]
+
+
+@dataclass(slots=True)
+class IdsService:
+    """
+    Deterministic, run-scoped ID generator.
+    """
+
+    run_id: str
+
+    def __post_init__(self) -> None:
+        self._counters: dict[str, int] = {}
+
+    def next_id(self, prefix: str) -> str:
+        n = self._counters.get(prefix, 0) + 1
+        self._counters[prefix] = n
+        return f"{prefix}_{n:06d}"
