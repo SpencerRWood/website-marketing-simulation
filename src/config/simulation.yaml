@@ -16,6 +16,9 @@ run:
 storage:
   duckdb_path: "data/sim.duckdb"  # Cold storage sink.
   clean_slate: true               # If true, database is recreated per run.
+  flush:
+    every_n_events: 5000
+    or_every_seconds: 30
 
 
 # ============================================================
@@ -63,18 +66,12 @@ users:
     mode: "recency_propensity_weighted"
 
     # Half-life (in hours) for recency decay.
-    # Controls how quickly inactive users become unlikely to return.
-    #
-    # Smaller → faster decay (more short-term clustering)
-    # Larger  → longer memory (more persistent users)
     recency_half_life_hours: 18
 
     # Weight assigned to latent user propensity (0–1).
-    # Higher → high-intent users dominate returning traffic.
     propensity_weight: 0.5
 
     # Weight assigned to recency score.
-    # Higher → recently active users dominate.
     recency_weight: 0.5
 
 
@@ -83,25 +80,14 @@ users:
   # ----------------------------------------------------------
   propensity:
     init:
-
       # Distribution used when creating a new user.
-      #
       # "uniform" → U(0,1)
       # "beta"    → Beta(alpha, beta)
-      #
-      # Beta is recommended for realistic skewed populations.
       dist: "beta"
 
       # Beta(alpha, beta) parameters.
-      #
       # Mean = alpha / (alpha + beta)
-      #
       # (2,6) → mean ≈ 0.25
-      #          Most users low intent,
-      #          small tail of high-intent users.
-      #
-      # Increasing alpha shifts population toward high intent.
-      # Increasing beta shifts population toward low intent.
       alpha: 2.0
       beta: 6.0
 
@@ -110,33 +96,15 @@ users:
   # Discovery Mode (New User State)
   # ----------------------------------------------------------
   discovery_mode:
-
-    # If enabled:
-    #   All new users start in discovery mode.
-    #   Discovery state modifies downstream session behavior.
     enabled: true
-
-    # Number of completed sessions before user graduates
-    # from discovery mode to normal state.
     graduation_sessions: 2
-
-    # Multiplier applied to page drop-off probability
-    # while in discovery mode.
-    #
-    # >1.0 → higher drop-off (less engaged new users)
-    # <1.0 → lower drop-off (sticky onboarding)
     dropoff_multiplier: 1.25
-
-    # Additive shift applied to conversion logit:
-    #
-    #   logit(p) += conversion_logit_shift
-    #
-    # Negative → lower early conversion
-    # Positive → onboarding boost
     conversion_logit_shift: -0.8
 
-# session_intent:
-#   queue_capacity: null   # null = unbounded, or set an int like 100000
+
+# ============================================================
+# Intent Resolver
+# ============================================================
 
 intent_resolver:
   enabled: true
@@ -148,14 +116,9 @@ intent_resolver:
 
 arrivals:
   baseline_arrivals:
-    # arrival strategy for baseline traffic
     model: "nhpp"
-
-    # mean baseline intents per day
     daily_expected_intents: 2000
-
     intraday_curve:
-      # intraday shape; normalized to integrate to daily_expected_intents
       type: "gaussian_peak"
       peak_hour: 12.0
       spread_hours: 3.0
@@ -163,24 +126,64 @@ arrivals:
 
 
 # ============================================================
+# Site Graph
+# ============================================================
+
+site_graph:
+  pages:
+    home:
+      dropoff_p: 0.25
+      transitions:
+        - ["product", 0.55]
+        - ["pricing", 0.25]
+
+    product:
+      dropoff_p: 0.15
+      transitions:
+        - ["pricing", 0.35]
+        - ["home", 0.10]
+
+    pricing:
+      dropoff_p: 0.20
+      transitions:
+        - ["checkout", 0.35]
+        - ["home", 0.10]
+
+    checkout:
+      dropoff_p: 0.30
+      transitions: []
+
+
+# ============================================================
 # Sessions
 # ============================================================
 
 sessions:
-  # Session ends if the user is inactive for this long between page views.
   inactivity_timeout_minutes: 30
-
-  # Hard cap on number of pages visited in a session.
   max_steps: null
-
-  # Entry page for all sessions (unless overridden by caller).
   entry_page: "home"
 
-  # Time between page views (user reading / navigating)
   inter_page_time:
     # Options: fixed | exponential
     dist: "exponential"
     fixed_seconds: 10.0
-
-    # Only used if dist == exponential
     mean_seconds: 10.0
+
+
+# ============================================================
+# Conversion
+# ============================================================
+
+conversion:
+  # Currently supported: "logistic"
+  model: "logistic"
+
+  # Hard cap on conversion probability per session.
+  cap: 0.35
+
+  # Baseline log-odds of conversion for an average user.
+  # -3.0 => ~4.7% before propensity + discovery modifiers
+  base_logit: -3.0
+
+  # Multiplier on user propensity in logit space.
+  propensity_coef: 2.0

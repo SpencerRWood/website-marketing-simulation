@@ -6,6 +6,7 @@ from typing import Any
 
 import simpy
 
+from sim.features.conversion.service import ConversionConfig, ConversionService
 from sim.features.sessions.service import (
     InterPageTimeConfig,
     SessionsConfig,
@@ -45,14 +46,12 @@ class DummyRng:
 
     def random(self) -> float:
         if self.idx >= len(self.values):
-            # default high value to avoid drop-off unless specified
             return 0.999
         v = float(self.values[self.idx])
         self.idx += 1
         return v
 
     def expovariate(self, lambd: float) -> float:
-        # not needed for fixed tests
         return 0.0
 
 
@@ -78,7 +77,6 @@ class DummyGraph:
         page = self.get_page(current_name)
         if not page or not page.transitions:
             return None
-        # deterministic choice: pick highest weight
         return sorted(page.transitions, key=lambda t: t[1], reverse=True)[0][0]
 
 
@@ -96,7 +94,7 @@ def test_session_emits_start_pageviews_end_no_next_page() -> None:
     }
     graph = DummyGraph(env=env, pages=pages, start_dt=datetime(2026, 1, 1, tzinfo=UTC))
 
-    rng = DummyRng(values=[0.5, 0.5, 0.5])  # always avoid drop-off
+    rng = DummyRng(values=[0.5, 0.5, 0.5])
     events = DummyEvents()
     ids = DummyIds()
 
@@ -134,12 +132,12 @@ def test_session_dropoff_emits_drop_off_and_end() -> None:
     env = simpy.Environment()
 
     pages = {
-        "home": Page(dropoff_p=1.0, transitions=[("product", 1.0)]),  # guaranteed drop-off
+        "home": Page(dropoff_p=1.0, transitions=[("product", 1.0)]),
         "product": Page(dropoff_p=0.0, transitions=[]),
     }
     graph = DummyGraph(env=env, pages=pages, start_dt=datetime(2026, 1, 1, tzinfo=UTC))
 
-    rng = DummyRng(values=[0.0])  # u < 1.0 => drop off
+    rng = DummyRng(values=[0.0])
     events = DummyEvents()
     ids = DummyIds()
 
@@ -178,15 +176,15 @@ def test_session_timeout_when_interpage_delay_exceeds_timeout() -> None:
     }
     graph = DummyGraph(env=env, pages=pages, start_dt=datetime(2026, 1, 1, tzinfo=UTC))
 
-    rng = DummyRng(values=[0.999])  # avoid drop-off
+    rng = DummyRng(values=[0.999])
     events = DummyEvents()
     ids = DummyIds()
 
     cfg = SessionsConfig(
-        inactivity_timeout_minutes=1.0,  # 60s
+        inactivity_timeout_minutes=1.0,
         max_steps=12,
         entry_page="home",
-        inter_page_time=InterPageTimeConfig(dist="fixed", fixed_seconds=999.0),  # exceeds timeout
+        inter_page_time=InterPageTimeConfig(dist="fixed", fixed_seconds=999.0),
     )
 
     svc = SessionsService(
@@ -204,27 +202,34 @@ def test_session_timeout_when_interpage_delay_exceeds_timeout() -> None:
 
     assert events.rows[-1]["event_type"] == "session_end"
     assert events.rows[-1]["value_str"] == "timeout"
-    # env should advance exactly to timeout boundary
     assert env.now == 60.0
 
 
-def test_session_unbounded_max_steps_ends_by_timeout_on_self_loop() -> None:
+def test_session_conversion_emits_conversion_and_ends() -> None:
     env = simpy.Environment()
 
     pages = {
-        "home": Page(dropoff_p=0.0, transitions=[("home", 1.0)]),  # self-loop forever if uncapped
+        "home": Page(dropoff_p=0.0, transitions=[("product", 1.0)]),
+        "product": Page(dropoff_p=0.0, transitions=[]),
     }
     graph = DummyGraph(env=env, pages=pages, start_dt=datetime(2026, 1, 1, tzinfo=UTC))
 
-    rng = DummyRng(values=[0.999] * 50)  # avoid drop-off
+    # random() stream:
+    #  - dropoff check (avoid): 0.999
+    #  - conversion check (convert): 0.0
+    rng = DummyRng(values=[0.999, 0.0])
     events = DummyEvents()
     ids = DummyIds()
 
     cfg = SessionsConfig(
-        inactivity_timeout_minutes=0.01,  # 0.6 seconds
-        max_steps=None,  # unlimited
+        inactivity_timeout_minutes=30,
+        max_steps=12,
         entry_page="home",
-        inter_page_time=InterPageTimeConfig(dist="fixed", fixed_seconds=999.0),  # triggers timeout
+        inter_page_time=InterPageTimeConfig(dist="fixed", fixed_seconds=0.0),
+    )
+
+    conv = ConversionService(
+        ConversionConfig(model="logistic", cap=1.0, base_logit=10.0, propensity_coef=0.0)
     )
 
     svc = SessionsService(
@@ -237,9 +242,16 @@ def test_session_unbounded_max_steps_ends_by_timeout_on_self_loop() -> None:
         cfg=cfg,
     )
 
-    svc.spawn(user_id="u1", session_id="s1", intent_source="baseline")
+    svc.spawn(
+        user_id="u1",
+        session_id="s1",
+        intent_source="baseline",
+        conversion=conv,
+        user_propensity=0.5,
+    )
     env.run()
 
-    assert events.rows[-1]["event_type"] == "session_end"
-    assert events.rows[-1]["value_str"] == "timeout"
-    assert env.now == 0.6
+    types = [r["event_type"] for r in events.rows]
+    assert "conversion" in types
+    assert types[-1] == "session_end"
+    assert events.rows[-1]["value_str"] == "conversion"
