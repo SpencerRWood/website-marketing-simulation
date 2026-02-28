@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import simpy
 
@@ -10,6 +11,8 @@ from sim.core.ids import IdsService, deterministic_run_id_from_config
 from sim.core.logging import get_logger
 from sim.core.rng import RNG
 from sim.core.types import RunContext
+from sim.features.arrivals.models.nhpp import GaussianPeakCurveConfig
+from sim.features.arrivals.service import ArrivalsService, BaselineArrivalsConfig
 from sim.features.intent_resolver.service import IntentResolverService
 from sim.features.intent_resolver.types import IntentResolverConfig
 from sim.features.persistence.duckdb_adapter import DuckDBAdapter
@@ -22,6 +25,24 @@ from sim.features.users_state.service import UsersConfig, UsersStateService
 class BootstrapResult:
     ctx: RunContext
     duckdb_path: str
+
+
+def _path_exists(d: dict[str, Any], path: list[str]) -> bool:
+    cur: Any = d
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return False
+        cur = cur[key]
+    return True
+
+
+def _get_path(d: dict[str, Any], path: list[str], default: Any = None) -> Any:
+    cur: Any = d
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
 
 
 def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> BootstrapResult:
@@ -104,13 +125,49 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
     raw = cfg.raw if isinstance(cfg.raw, dict) else {}
     has_users = "users" in raw
     has_intent_resolver = "intent_resolver" in raw
-    has_baseline_intents = "baseline_intents" in raw
+    has_baseline_arrivals = _path_exists(raw, ["arrivals", "baseline_arrivals"])
 
-    enable_activity = has_users or has_intent_resolver or has_baseline_intents
+    enable_activity = has_users or has_intent_resolver or has_baseline_arrivals
 
     if enable_activity:
         # ----- session-intent bus -----
         session_intents = SessionIntentService(env=env, ids=ids, capacity=None)
+
+        # Adapter: arrivals publishes SessionIntent objects; SessionIntentService expects publish_new(...)
+        class SessionIntentBusAdapter:
+            def __init__(self, bus: SessionIntentService) -> None:
+                self._bus = bus
+
+            def publish(self, intent) -> None:
+                """
+                Be tolerant to evolving SessionIntentService signatures.
+                """
+                # Prefer passing intent_id/channel if supported; fall back gracefully.
+                try:
+                    self._bus.publish_new(
+                        ts_utc=intent.ts_utc,
+                        intent_source=intent.intent_source,
+                        channel=intent.channel,
+                        intent_id=intent.intent_id,
+                    )
+                    return
+                except TypeError:
+                    pass
+
+                try:
+                    self._bus.publish_new(
+                        ts_utc=intent.ts_utc,
+                        intent_source=intent.intent_source,
+                        channel=intent.channel,
+                    )
+                    return
+                except TypeError:
+                    pass
+
+                # Minimal required shape
+                self._bus.publish_new(ts_utc=intent.ts_utc, intent_source=intent.intent_source)
+
+        intent_bus = SessionIntentBusAdapter(session_intents)
 
         # ----- users hot state (REAL) -----
         users_cfg = getattr(cfg, "users", None)
@@ -142,8 +199,8 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
                     event_type="session_end",
                     user_id=user_id,
                     session_id=session_id,
-                    intent_source=intent.intent_source,
-                    channel=intent.channel,
+                    intent_source=getattr(intent, "intent_source", None),
+                    channel=getattr(intent, "channel", None),
                 )
                 self._users.mark_session_end(user_id=user_id, now_utc=now_utc)
                 yield self._env.timeout(0)
@@ -166,15 +223,48 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
         )
         resolver.start()
 
-        # ----- baseline intent producer (only when activity enabled) -----
-        def baseline_intent_driver():
-            step_s = 3600.0  # placeholder: 1 intent/hour
-            while True:
-                ts = start_dt_utc + timedelta(seconds=float(env.now))
-                session_intents.publish_new(ts_utc=ts, intent_source="baseline")
-                yield env.timeout(step_s)
+        # ----- baseline arrivals (NHPP) -----
+        # Minimal graph/clock adapter: arrivals only needs get_current_time()
+        class ClockGraph:
+            def __init__(self, env: simpy.Environment, start_dt_utc: datetime) -> None:
+                self._env = env
+                self._start = start_dt_utc
 
-        env.process(baseline_intent_driver())
+            def get_current_time(self) -> datetime:
+                return self._start + timedelta(seconds=float(self._env.now))
+
+        if has_baseline_arrivals:
+            b = _get_path(raw, ["arrivals", "baseline_arrivals"], default={}) or {}
+
+            # Defaults are intentionally conservative; if you omit baseline_arrivals entirely,
+            # bootstrap stays minimal (enable_activity stays False).
+            model = str(b.get("model", "nhpp"))
+            daily_expected_intents = float(b.get("daily_expected_intents", 0.0))
+
+            curve = b.get("intraday_curve", {}) or {}
+            peak_hour = float(curve.get("peak_hour", 12.0))
+            spread_hours = float(curve.get("spread_hours", 3.0))
+            floor = float(curve.get("floor", 0.05))
+
+            arrivals = ArrivalsService(
+                run_id=ctx.run_id,
+                rng=rng,
+                ids=ids,
+                graph=ClockGraph(env=env, start_dt_utc=start_dt_utc),
+                intent_bus=intent_bus,
+                baseline_arrivals=BaselineArrivalsConfig(
+                    model=model,
+                    daily_expected_intents=daily_expected_intents,
+                    intraday_curve=GaussianPeakCurveConfig(
+                        peak_hour=peak_hour,
+                        spread_hours=spread_hours,
+                        floor=floor,
+                    ),
+                ),
+                num_days=int(cfg.run.num_days),
+                events=sink,  # sink has .emit(...) compatible with arrivals EventsLike
+            )
+            arrivals.start(env)
 
     # ----- run lifecycle -----
     try:
