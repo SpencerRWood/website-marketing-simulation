@@ -5,6 +5,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from sim.features.conversion.service import ConversionService
+
 # ----------------------------
 # Config models
 # ----------------------------
@@ -93,9 +95,17 @@ def _new_event_id(ids: Any) -> str:
     Deterministic ID generation should come from your ids service.
     We probe common method names.
     """
-    for name in ("event_id", "new_event_id", "next_id"):
+    for name in ("event_id", "new_event_id"):
         if hasattr(ids, name):
             fn = getattr(ids, name)
+            return str(fn())
+
+    # IdsService uses next_id(prefix)
+    if hasattr(ids, "next_id"):
+        fn = ids.next_id
+        try:
+            return str(fn("evt"))
+        except TypeError:
             return str(fn())
     raise TypeError("ids must provide event_id() or new_event_id() or next_id()")
 
@@ -136,6 +146,7 @@ class SessionsService:
       - session_start
       - page_view (one per visited page)
       - drop_off (if page dropoff triggers)
+      - conversion (if applicable)
       - session_end (always)
 
     Timeout rule:
@@ -167,18 +178,25 @@ class SessionsService:
         user_id: str,
         session_id: str,
         intent_source: str | None = None,
+        channel: str | None = None,
         entry_page: str | None = None,
+        conversion: ConversionService | None = None,
+        user_propensity: float | None = None,
+        dropoff_multiplier: float = 1.0,
+        conversion_logit_shift: float = 0.0,
     ) -> Any:
-        """
-        Spawn the SimPy process for this session.
-        """
         page0 = entry_page or self.cfg.entry_page
         return self.env.process(
             self._run_session(
                 user_id=user_id,
                 session_id=session_id,
                 intent_source=intent_source,
+                channel=channel,
                 entry_page=page0,
+                conversion=conversion,
+                user_propensity=user_propensity,
+                dropoff_multiplier=dropoff_multiplier,
+                conversion_logit_shift=conversion_logit_shift,
             )
         )
 
@@ -189,6 +207,7 @@ class SessionsService:
         user_id: str,
         session_id: str,
         intent_source: str | None = None,
+        channel: str | None = None,
         page: str | None = None,
         value_num: float | None = None,
         value_str: str | None = None,
@@ -204,6 +223,7 @@ class SessionsService:
             "session_id": session_id,
             "event_type": event_type,
             "intent_source": intent_source,
+            "channel": channel,
             "page": page,
             "value_num": value_num,
             "value_str": value_str,
@@ -217,9 +237,14 @@ class SessionsService:
         user_id: str,
         session_id: str,
         intent_source: str | None,
+        channel: str | None,
         entry_page: str,
+        conversion: ConversionService | None,
+        user_propensity: float | None,
+        dropoff_multiplier: float,
+        conversion_logit_shift: float,
     ):
-        max_steps = self.cfg.max_steps  # int | None
+        max_steps = self.cfg.max_steps
         timeout_s = float(self.cfg.inactivity_timeout_minutes) * 60.0
 
         self._emit(
@@ -227,6 +252,7 @@ class SessionsService:
             user_id=user_id,
             session_id=session_id,
             intent_source=intent_source,
+            channel=channel,
             page=entry_page,
         )
 
@@ -241,29 +267,32 @@ class SessionsService:
         while current is not None and _under_step_cap():
             steps += 1
 
-            # Page view
             self._emit(
                 event_type="page_view",
                 user_id=user_id,
                 session_id=session_id,
                 intent_source=intent_source,
+                channel=channel,
                 page=current,
                 value_num=float(steps),
             )
 
-            # Drop-off check uses page.dropoff_p if present
+            # Drop-off
             page_obj = self.graph.get_page(current)
             dropoff_p = 0.0
             if page_obj is not None and hasattr(page_obj, "dropoff_p"):
                 dropoff_p = float(page_obj.dropoff_p or 0.0)
 
-            u = float(self.rng.random())
-            if u < dropoff_p:
+            if dropoff_multiplier != 1.0:
+                dropoff_p = max(0.0, min(1.0, float(dropoff_p) * float(dropoff_multiplier)))
+
+            if float(self.rng.random()) < dropoff_p:
                 self._emit(
                     event_type="drop_off",
                     user_id=user_id,
                     session_id=session_id,
                     intent_source=intent_source,
+                    channel=channel,
                     page=current,
                     value_num=dropoff_p,
                 )
@@ -272,24 +301,53 @@ class SessionsService:
                     user_id=user_id,
                     session_id=session_id,
                     intent_source=intent_source,
+                    channel=channel,
                     page=current,
                     value_str="drop_off",
                     value_num=float(steps),
                 )
                 return
 
-            # Inter-page time
-            delay_s = _sample_inter_page_delay_s(self.cfg.inter_page_time, self.rng)
+            # Conversion (at most once per session)
+            if conversion is not None:
+                prop = 0.5 if user_propensity is None else float(user_propensity)
+                did_convert, p_conv = conversion.should_convert(
+                    propensity=prop,
+                    logit_shift=float(conversion_logit_shift),
+                    rng=self.rng,
+                )
+                if did_convert:
+                    self._emit(
+                        event_type="conversion",
+                        user_id=user_id,
+                        session_id=session_id,
+                        intent_source=intent_source,
+                        channel=channel,
+                        page=current,
+                        value_num=float(p_conv),
+                    )
+                    self._emit(
+                        event_type="session_end",
+                        user_id=user_id,
+                        session_id=session_id,
+                        intent_source=intent_source,
+                        channel=channel,
+                        page=current,
+                        value_str="conversion",
+                        value_num=float(steps),
+                    )
+                    return
 
-            # Timeout if the user "goes idle" too long
+            # Inter-page time + timeout
+            delay_s = _sample_inter_page_delay_s(self.cfg.inter_page_time, self.rng)
             if timeout_s > 0 and delay_s > timeout_s:
-                # advance to timeout boundary for consistent sim clock
                 yield self.env.timeout(timeout_s)
                 self._emit(
                     event_type="session_end",
                     user_id=user_id,
                     session_id=session_id,
                     intent_source=intent_source,
+                    channel=channel,
                     page=current,
                     value_str="timeout",
                     value_num=float(steps),
@@ -299,14 +357,18 @@ class SessionsService:
             if delay_s > 0:
                 yield self.env.timeout(delay_s)
 
-            # Transition
-            nxt = self.graph.next_page(current, self.rng)
+            # Transition (support both signatures)
+            try:
+                nxt = self.graph.next_page(current, self.rng)
+            except TypeError:
+                nxt = self.graph.next_page(current)
             if nxt is None:
                 self._emit(
                     event_type="session_end",
                     user_id=user_id,
                     session_id=session_id,
                     intent_source=intent_source,
+                    channel=channel,
                     page=current,
                     value_str="no_next_page",
                     value_num=float(steps),
@@ -315,27 +377,25 @@ class SessionsService:
 
             current = nxt
 
-        # Only possible exits here:
-        #   - max_steps cap hit (when max_steps is not None)
-        #   - current becomes None (should not happen given guards, but handle anyway)
         if max_steps is not None and steps >= int(max_steps):
             self._emit(
                 event_type="session_end",
                 user_id=user_id,
                 session_id=session_id,
                 intent_source=intent_source,
+                channel=channel,
                 page=current,
                 value_str="max_steps",
                 value_num=float(steps),
             )
             return
 
-        # Defensive fallback if current somehow becomes None without earlier termination
         self._emit(
             event_type="session_end",
             user_id=user_id,
             session_id=session_id,
             intent_source=intent_source,
+            channel=channel,
             page=current,
             value_str="ended",
             value_num=float(steps),

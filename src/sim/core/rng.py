@@ -31,3 +31,6 @@ class RNG:
         k: int = 1,
     ) -> list[T]:
         return self._r.choices(population, weights=weights, k=k)
+
+    def expovariate(self, lambd: float) -> float:
+        return self._r.expovariate(lambd)
