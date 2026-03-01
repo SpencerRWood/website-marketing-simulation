@@ -187,3 +187,29 @@ conversion:
 
   # Multiplier on user propensity in logit space.
   propensity_coef: 2.0
+
+# ============================================================
+# Channels
+# ============================================================
+
+channels:
+  - name: "paid_display"
+    exposure_rate_per_user_per_day: 6.0
+    click_through_rate: 0.0015
+    incremental_intent: true
+    params:
+      viewable_share: 0.55
+      freq_cap_per_user_per_day: 4
+      ctr_multiplier: 1.0
+      incremental_click_share: 0.8
+  - name: "paid_search"
+    exposure_rate_per_user_per_day: 0.8
+    click_through_rate: 0.08
+    incremental_intent: true
+    params:
+      in_market_share_per_day: 0.25
+      freq_cap_per_user_per_day: 2
+      brand_share: 0.35
+      brand_ctr_multiplier: 1.8
+      nonbrand_ctr_multiplier: 0.9
+      incremental_click_share: 0.6
