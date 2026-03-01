@@ -8,9 +8,8 @@ run:
   start_date: "2026-01-01" # Simulation start date (UTC).
   num_days: 30             # Number of simulated calendar days.
 
-
 # ============================================================
-# Storage (Cold Layer)
+# Infrastructure (Cold Layer + Logging)
 # ============================================================
 
 storage:
@@ -20,14 +19,22 @@ storage:
     every_n_events: 5000
     or_every_seconds: 30
 
-
-# ============================================================
-# Logging
-# ============================================================
-
 logging:
   level: "INFO"  # Structured logging level.
 
+# ============================================================
+# Demand Generation (Baseline Traffic)
+# ============================================================
+
+arrivals:
+  baseline_arrivals:
+    model: "nhpp"
+    daily_expected_intents: 2000
+    intraday_curve:
+      type: "gaussian_peak"
+      peak_hour: 12.0
+      spread_hours: 3.0
+      floor: 0.05
 
 # ============================================================
 # Users (Hot Layer Behavioral Engine)
@@ -41,28 +48,10 @@ users:
   #   Otherwise → select an existing user via weighted sampling.
   new_user_share: 0.85
 
-
   # ----------------------------------------------------------
   # Returning User Selection Model
   # ----------------------------------------------------------
   selection:
-
-    # Currently supported mode:
-    # "recency_propensity_weighted"
-    #
-    # Weight formula:
-    #
-    #   weight_i =
-    #       recency_weight * recency_score_i
-    #     + propensity_weight * propensity_i
-    #
-    # where:
-    #   recency_score_i = exp(-ln(2) * age_hours / half_life)
-    #
-    # So:
-    #   age = half_life → score = 0.5
-    #   age = 2*half_life → score = 0.25
-    #
     mode: "recency_propensity_weighted"
 
     # Half-life (in hours) for recency decay.
@@ -73,7 +62,6 @@ users:
 
     # Weight assigned to recency score.
     recency_weight: 0.5
-
 
   # ----------------------------------------------------------
   # Latent Propensity Distribution (User Heterogeneity)
@@ -91,7 +79,6 @@ users:
       alpha: 2.0
       beta: 6.0
 
-
   # ----------------------------------------------------------
   # Discovery Mode (New User State)
   # ----------------------------------------------------------
@@ -101,7 +88,6 @@ users:
     dropoff_multiplier: 1.25
     conversion_logit_shift: -0.8
 
-
 # ============================================================
 # Intent Resolver
 # ============================================================
@@ -109,21 +95,121 @@ users:
 intent_resolver:
   enabled: true
 
+# ============================================================
+# Marketing Pressure Layer (Spend → Adstock/Saturation → Channel Execution)
+# ============================================================
+
+campaigns:
+
+  # Master toggle.
+  # If false:
+  #   - No campaign schedules are compiled.
+  #   - raw_spend(channel, t) always returns 0.
+  #   - Adstock/saturation receives zero input.
+  enabled: true
+
+  # Temporal resolution of spend buckets.
+  # Currently supported: "hour"
+  time_resolution: "hour"
+
+  # Metadata only (no currency conversion performed).
+  default_currency: "USD"
+
+  campaigns:
+    - name: "brand_search_push"
+
+      # Must match a `channels.name` below.
+      # (Fixed from "search" → "paid_search" to match your channel list.)
+      channel: "paid_search"
+
+      # Inclusive campaign window (UTC calendar dates).
+      start_date: "2026-01-05"
+      end_date: "2026-01-20"
+
+      # Exactly ONE of:
+      total_budget: 15000
+      # daily_budget: 1000
+
+      # Spend distribution shape across active hours:
+      # uniform | front_loaded | back_loaded
+      pacing: "uniform"
+
+      # Optional activation constraints.
+      # If omitted → active 24h/day across entire window.
+      activation:
+        days_of_week: ["mon","tue","wed","thu","fri"]
+        hours: [8,9,10,11,12,13,14,15,16,17]
 
 # ============================================================
-# Arrivals
+# Adstock + Saturation (Transform Layer)
 # ============================================================
+#
+# This feature does NOT create exposures or sessions directly.
+# It transforms upstream spend (or other channel inputs) into an
+# "effective" signal that reflects:
+#   1) Carryover (adstock): past spend continues to contribute
+#   2) Diminishing returns (saturation): marginal gains shrink at higher levels
+#
+adstock_saturation:
+  enabled: true
 
-arrivals:
-  baseline_arrivals:
-    model: "nhpp"
-    daily_expected_intents: 2000
-    intraday_curve:
-      type: "gaussian_peak"
-      peak_hour: 12.0
-      spread_hours: 3.0
-      floor: 0.05
+  # If true, carryover state is tracked per (channel, campaign_id).
+  # If false, state is tracked per channel only (campaigns share memory).
+  per_campaign_state: false
 
+  channels:
+    # Paid Search: weak carryover (short half-life), saturates quickly
+    paid_search:
+      adstock:
+        model: "geometric"
+        half_life_days: 1.0
+      saturation:
+        model: "hill"
+        alpha: 1.2
+        gamma: 2000.0
+        max_effect: 1.0
+
+    # Paid Display: stronger carryover (longer half-life), saturates later
+    paid_display:
+      adstock:
+        model: "geometric"
+        half_life_days: 7.0
+      saturation:
+        model: "hill"
+        alpha: 1.6
+        gamma: 5000.0
+        max_effect: 1.0
+
+# ============================================================
+# Channels (Execution Layer)
+# ============================================================
+#
+# Channels are traffic generators that create exposures → clicks → session_intents.
+# They do NOT contain adstock/saturation logic; they consume upstream pressure.
+#
+
+channels:
+  - name: "paid_display"
+    exposure_rate_per_user_per_day: 6.0
+    click_through_rate: 0.0015
+    incremental_intent: true
+    params:
+      viewable_share: 0.55
+      freq_cap_per_user_per_day: 4
+      ctr_multiplier: 1.0
+      incremental_click_share: 0.8
+
+  - name: "paid_search"
+    exposure_rate_per_user_per_day: 0.8
+    click_through_rate: 0.08
+    incremental_intent: true
+    params:
+      in_market_share_per_day: 0.25
+      freq_cap_per_user_per_day: 2
+      brand_share: 0.35
+      brand_ctr_multiplier: 1.8
+      nonbrand_ctr_multiplier: 0.9
+      incremental_click_share: 0.6
 
 # ============================================================
 # Site Graph
@@ -153,205 +239,27 @@ site_graph:
       dropoff_p: 0.30
       transitions: []
 
-
 # ============================================================
 # Sessions
 # ============================================================
 
 sessions:
   inactivity_timeout_minutes: 30
-  max_steps: null
+  max_steps: null            # If null, no maximum step limit.
   entry_page: "home"
 
   inter_page_time:
     # Options: fixed | exponential
     dist: "exponential"
-    fixed_seconds: 10.0
-    mean_seconds: 10.0
-
+    fixed_seconds: 10.0      # Used only when dist="fixed"
+    mean_seconds: 10.0       # Used only when dist="exponential"
 
 # ============================================================
 # Conversion
 # ============================================================
 
 conversion:
-  # Currently supported: "logistic"
-  model: "logistic"
-
-  # Hard cap on conversion probability per session.
-  cap: 0.35
-
-  # Baseline log-odds of conversion for an average user.
-  # -3.0 => ~4.7% before propensity + discovery modifiers
-  base_logit: -3.0
-
-  # Multiplier on user propensity in logit space.
-  propensity_coef: 2.0
-
-# ============================================================
-# Channels (Execution Layer)
-# ============================================================
-#
-# Channels are traffic generators that create exposures → clicks → session_intents.
-# They can operate in:
-#   1) Rate-driven mode (current): Poisson exposures per user per day
-#   2) Delivery-plan mode (future): impressions provided by campaign layer
-#
-# All randomness flows through the seeded RNG.
-# All click → intent logic is configurable per channel.
-#
-# Important:
-# - Channels DO NOT contain adstock or saturation logic.
-# - Channels are execution mechanics only.
-# - Transformations (adstock, saturation) occur upstream in future features.
-#
-
-channels:
-
-  # ------------------------------------------------------------
-  # Paid Display (Upper / Mid Funnel)
-  # ------------------------------------------------------------
-  #
-  # Broad reach channel with:
-  #   - High impression volume
-  #   - Low CTR
-  #   - Viewability filtering
-  #   - Strong frequency caps
-  #
-  # Rate-driven interpretation:
-  #   For each user:
-  #     N ~ Poisson(exposure_rate_per_user_per_day)
-  #     Each impression passes viewability filter (viewable_share)
-  #     Up to freq_cap_per_user_per_day exposures per user
-  #
-  # Modeling assumptions:
-  #   - Broad targeting (no in-market gating)
-  #   - High incrementality relative to search
-  #   - No demand capture logic
-  #
-  - name: "paid_display"
-
-    # Average raw impressions per user per day (Poisson λ)
-    exposure_rate_per_user_per_day: 6.0
-
-    # Base probability of click given a viewable exposure
-    click_through_rate: 0.0015
-
-    # If true, clicks may generate session_intent events
-    incremental_intent: true
-
-    params:
-
-      # Fraction of impressions that become viewable exposures
-      # (industry typical ~50–70%)
-      viewable_share: 0.55
-
-      # Maximum number of exposures per user per day
-      freq_cap_per_user_per_day: 4
-
-      # Multiplier applied to base CTR (useful for creative quality tests)
-      ctr_multiplier: 1.0
-
-      # Probability that a click generates incremental intent
-      # (models lift vs passive demand)
-      incremental_click_share: 0.8
-
-
-  # ------------------------------------------------------------
-  # Paid Search (Lower Funnel / Demand Capture)
-  # ------------------------------------------------------------
-  #
-  # Intent-driven channel with:
-  #   - Lower reach
-  #   - Higher CTR
-  #   - In-market gating
-  #   - Brand vs non-brand differentiation
-  #
-  # Rate-driven interpretation:
-  #   For each user:
-  #     With probability in_market_share_per_day → eligible
-  #     N ~ Poisson(exposure_rate_per_user_per_day)
-  #     Up to freq_cap_per_user_per_day exposures
-  #     CTR modified by brand/nonbrand mix
-  #
-  # Modeling assumptions:
-  #   - Captures existing demand
-  #   - Partial incrementality (substitution risk)
-  #   - Lower carryover (handled in adstock feature later)
-  #
-  - name: "paid_search"
-
-    # Average search impression opportunities per eligible user per day
-    exposure_rate_per_user_per_day: 0.8
-
-    # Base click probability before brand/nonbrand adjustments
-    click_through_rate: 0.08
-
-    # If true, clicks may generate session_intent events
-    incremental_intent: true
-
-    params:
-
-      # Fraction of users considered "actively searching" on a given day
-      in_market_share_per_day: 0.25
-
-      # Max impressions per user per day
-      freq_cap_per_user_per_day: 2
-
-      # Fraction of impressions that are branded queries
-      brand_share: 0.35
-
-      # CTR multiplier for brand queries
-      brand_ctr_multiplier: 1.8
-
-      # CTR multiplier for non-brand queries
-      nonbrand_ctr_multiplier: 0.9
-
-      # Probability that a click is incremental
-      # (brand often lower; non-brand often higher)
-      incremental_click_share: 0.6
-
-
-# ============================================================
-# Adstock + Saturation (Transform Layer)
-# ============================================================
-#
-# This feature does NOT create exposures or sessions directly.
-# It transforms upstream spend (or other channel inputs) into an
-# "effective" signal that reflects:
-#   1) Carryover (adstock): past spend continues to contribute
-#   2) Diminishing returns (saturation): marginal gains shrink at higher levels
-#
-# This will be consumed by a future campaigns/spend feature to produce
-# DeliveryPlans (impressions over time) that feed channels_exposure.
-#
-adstock_saturation:
-  enabled: true
-
-  # If true, carryover state is tracked per (channel, campaign_id).
-  # If false, state is tracked per channel only (campaigns share memory).
-  per_campaign_state: false
-
-  channels:
-
-    # Paid Search: weak carryover (short half-life), saturates quickly
-    paid_search:
-      adstock:
-        model: "geometric"
-        half_life_days: 1.0
-      saturation:
-        model: "hill"
-        alpha: 1.2
-        gamma: 2000.0
-        max_effect: 1.0
-
-    # Paid Display: stronger carryover (longer half-life), saturates later
-    paid_display:
-      adstock:
-        model: "geometric"
-        half_life_days: 7.0
-      saturation:
-        model: "hill"
-        alpha: 1.6
-        gamma: 5000.0
-        max_effect: 1.0
+  model: "logistic"          # Currently supported: "logistic"
+  cap: 0.35                  # Hard cap on conversion probability per session.
+  base_logit: -3.0           # Baseline log-odds for an average user.
+  propensity_coef: 2.0       # Multiplier on user propensity in logit space.
