@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import simpy
 
 from sim.features.channels_exposure.channels.base import Channel
+from sim.features.channels_exposure.channels.paid_display import build as build_paid_display
 from sim.features.channels_exposure.channels.paid_search import build as build_paid_search
 from sim.features.channels_exposure.types import (
     ChannelConfig,
@@ -157,6 +158,8 @@ def build_channels(cfgs: list[ChannelConfig]) -> list[Channel]:
     for c in cfgs:
         if c.name == "paid_search":
             built.append(build_paid_search(c))
+        elif c.name == "paid_display":
+            built.append(build_paid_display(c))
         else:
             raise ValueError(f"Unknown channel: {c.name}")
     return built
