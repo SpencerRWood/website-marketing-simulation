@@ -128,6 +128,16 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
     )
 
     try:
+        # ============================================================
+        # Marketing pressure: Campaign Planner (pure, deterministic)
+        # ============================================================
+        # _campaign_planner = CampaignPlannerService.from_raw_config(
+        #     start_dt_utc=start_dt_utc,
+        #     raw=raw,
+        # )
+        # NOTE: campaign_planner is wired for downstream consumption (adstock/saturation → delivery plans).
+        # It is intentionally not used here yet.
+
         # ----- users hot state -----
         users_cfg = _parse_users_config(raw)
         users = UsersStateService(cfg=users_cfg)
@@ -154,7 +164,8 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
         # ----- arrivals (baseline intents) -----
         if "arrivals" in raw:
             a_raw = raw.get("arrivals") or {}
-            b_raw = a_raw.get("baseline_intents") or {}
+            # Back-compat: support either "baseline_intents" or "baseline_arrivals"
+            b_raw = a_raw.get("baseline_intents") or a_raw.get("baseline_arrivals") or {}
             curve_raw = b_raw.get("intraday_curve") or {}
             baseline_cfg = BaselineArrivalsConfig(
                 model=str(b_raw.get("model", "nhpp")),
@@ -261,11 +272,73 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
         )
         resolver.start()
 
+        # ============================================================
+        # Channels Exposure (rate-driven mode)
+        # ============================================================
+        # Only start if config actually defines channels; this keeps minimal bootstrap tests passing.
+        ch_list = raw.get("channels")
+        if isinstance(ch_list, list) and len(ch_list) > 0:
+            from sim.features.channels_exposure.service import (
+                ChannelsExposureService,
+                build_channels,
+            )
+            from sim.features.channels_exposure.types import ChannelConfig, ChannelsExposureConfig
+
+            # ChannelsExposureConfig: default enabled=True unless explicitly disabled via channels_exposure.enabled
+            ce_raw = raw.get("channels_exposure") or {}
+            ce_enabled = bool(ce_raw.get("enabled", True))
+
+            # Build ChannelConfig list from raw channel dicts (matching your YAML)
+            cfgs: list[ChannelConfig] = []
+            for idx, c in enumerate(ch_list):
+                if not isinstance(c, dict):
+                    raise TypeError(f"channels[{idx}] must be a mapping")
+
+                cfgs.append(
+                    ChannelConfig(
+                        name=str(c.get("name")),
+                        exposure_rate_per_user_per_day=float(
+                            c.get("exposure_rate_per_user_per_day", 0.0)
+                        ),
+                        click_through_rate=float(c.get("click_through_rate", 0.0)),
+                        incremental_intent=bool(c.get("incremental_intent", True)),
+                        params=dict(c.get("params") or {}),
+                    )
+                )
+
+            # Minimal ctx adapter expected by ChannelsExposureService (ctx.rng)
+            class _ChannelsCtx:
+                def __init__(self, rng_: RNG) -> None:
+                    self.rng = rng_
+
+            channels_svc = ChannelsExposureService(
+                cfg=ChannelsExposureConfig(enabled=ce_enabled),
+                channels=build_channels(cfgs),
+                events=events,
+                website_graph=graph,
+                intent_bus=session_intents,
+                ctx=_ChannelsCtx(rng),
+                delivery_plan_provider=None,  # will be wired later (campaigns → adstock/sat → delivery plans)
+            )
+            channels_svc.start(
+                env,
+                users_state=users,
+                start_dt_utc=start_dt_utc,
+                num_days=int(cfg.run.num_days),
+            )
+
         # ----- run lifecycle -----
         events.emit("run_started")
 
         horizon_s = int(cfg.run.num_days) * 86400
-        logger.info("starting sim", extra={"run_id": ctx.run_id, "until_s": horizon_s})
+        logger.info(
+            "starting sim",
+            extra={
+                "run_id": ctx.run_id,
+                "until_s": horizon_s,
+                "campaigns_enabled": bool(raw.get("campaigns", {}).get("enabled", False)),
+            },
+        )
         env.run(until=horizon_s)
 
         events.emit("run_finished")
