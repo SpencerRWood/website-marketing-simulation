@@ -7,7 +7,7 @@ import simpy
 
 from sim.features.arrivals.models.nhpp import GaussianPeakCurveConfig
 from sim.features.arrivals.service import ArrivalsService, BaselineArrivalsConfig
-from sim.features.arrivals.types import SessionIntent
+from sim.features.session_intent.types import SessionIntent
 
 
 class DummyIds:

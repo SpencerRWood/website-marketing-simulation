@@ -42,11 +42,3 @@ class DeliverySlice:
 class DeliveryPlan:
     channel: str
     slices: list[DeliverySlice]
-
-
-@dataclass(frozen=True)
-class SessionIntent:
-    intent_source: str
-    channel: str | None
-    ts_utc: Any
-    sim_time_s: float

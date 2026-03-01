@@ -9,12 +9,9 @@ import simpy
 from sim.features.channels_exposure.channels.base import Channel
 from sim.features.channels_exposure.channels.paid_display import build as build_paid_display
 from sim.features.channels_exposure.channels.paid_search import build as build_paid_search
-from sim.features.channels_exposure.types import (
-    ChannelConfig,
-    ChannelsExposureConfig,
-    DeliveryPlan,
-    SessionIntent,
-)
+from sim.features.channels_exposure.types import ChannelConfig, ChannelsExposureConfig, DeliveryPlan
+from sim.features.events.types import EventsEmitter
+from sim.features.session_intent.service import SessionIntentService
 
 _SECONDS_PER_DAY = 24 * 60 * 60
 
@@ -26,9 +23,9 @@ DeliveryPlanProvider = Callable[[int, float, float], list[DeliveryPlan]]
 class ChannelsExposureService:
     cfg: ChannelsExposureConfig
     channels: list[Channel]
-    persistence: any
+    events: EventsEmitter
     website_graph: any
-    intents_store: simpy.Store
+    intent_bus: SessionIntentService
     ctx: any
     delivery_plan_provider: DeliveryPlanProvider | None = None
 
@@ -94,62 +91,41 @@ class ChannelsExposureService:
     # emission hooks
     # -----------------------
     def _emit_exposure(self, *, user_id: str, channel: str, campaign_id: str | None = None) -> None:
-        now_ts = self.website_graph.get_current_time()
-        self.persistence.emit(
-            event_type="exposure",
-            ts_utc=now_ts,
-            sim_time_s=float(self.website_graph.env.now),
-            run_id=self.ctx.run_id,
+        self.events.emit(
+            "exposure",
             user_id=user_id,
-            session_id=None,
-            intent_source=None,
             channel=channel,
-            page=None,
-            value_num=None,
-            value_str=None,
-            payload_json={"campaign_id": campaign_id} if campaign_id else None,
+            payload={"campaign_id": campaign_id} if campaign_id else None,
         )
 
     def _emit_click(self, *, user_id: str, channel: str, campaign_id: str | None = None) -> None:
-        now_ts = self.website_graph.get_current_time()
-        self.persistence.emit(
-            event_type="click",
-            ts_utc=now_ts,
-            sim_time_s=float(self.website_graph.env.now),
-            run_id=self.ctx.run_id,
+        self.events.emit(
+            "click",
             user_id=user_id,
-            session_id=None,
-            intent_source=None,
             channel=channel,
-            page=None,
-            value_num=None,
-            value_str=None,
-            payload_json={"campaign_id": campaign_id} if campaign_id else None,
+            payload={"campaign_id": campaign_id} if campaign_id else None,
         )
 
     def _emit_intent(self, *, user_id: str, channel: str, campaign_id: str | None = None) -> None:
         now_ts = self.website_graph.get_current_time()
-        intent = SessionIntent(
+
+        # publish onto canonical intent bus (assigns intent_id + enforces capacity)
+        self.intent_bus.publish_new(
+            ts_utc=now_ts,
             intent_source=f"channel:{channel}",
             channel=channel,
-            ts_utc=now_ts,
-            sim_time_s=float(self.website_graph.env.now),
+            payload={"campaign_id": campaign_id} if campaign_id else None,
         )
-        self.intents_store.put(intent)
 
-        self.persistence.emit(
+        # also emit cold event
+        self.events.emit(
             event_type="session_intent",
-            ts_utc=now_ts,
-            sim_time_s=float(self.website_graph.env.now),
-            run_id=self.ctx.run_id,
             user_id=user_id,
             session_id=None,
             intent_source=f"channel:{channel}",
             channel=channel,
             page=None,
-            value_num=None,
-            value_str=None,
-            payload_json={"campaign_id": campaign_id} if campaign_id else None,
+            payload={"campaign_id": campaign_id} if campaign_id else None,
         )
 
 

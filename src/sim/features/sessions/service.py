@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
+from sim.core.rng import RNG
 from sim.features.conversion.service import ConversionService
+from sim.features.events.types import EventsEmitter
+from sim.features.site_graph.types import WebsiteGraph
 
 # ----------------------------
 # Config models
@@ -14,10 +16,9 @@ from sim.features.conversion.service import ConversionService
 
 @dataclass(frozen=True)
 class InterPageTimeConfig:
-    """
-    Minimal distribution support:
-      - fixed: always fixed_seconds
-      - exponential: mean_seconds
+    """Minimal distribution support:
+    - fixed: always fixed_seconds
+    - exponential: mean_seconds
     """
 
     dist: str = "fixed"
@@ -27,7 +28,8 @@ class InterPageTimeConfig:
 
 @dataclass(frozen=True)
 class SessionsConfig:
-    """
+    """Session rules.
+
     max_steps:
       - int  -> hard cap on number of page_view steps
       - None -> no cap (session ends only via dropoff/timeout/no_next_page)
@@ -40,74 +42,8 @@ class SessionsConfig:
 
 
 # ----------------------------
-# Protocols (keeps integration flexible)
-# ----------------------------
-
-
-class WebsiteGraphLike(Protocol):
-    def get_current_time(self): ...
-    def get_page(self, name: str): ...
-    def next_page(self, current_name: str, rng: Any) -> str | None: ...
-
-
-class RNGLike(Protocol):
-    def random(self) -> float: ...
-    def expovariate(self, lambd: float) -> float: ...
-
-
-class EventsLike(Protocol):
-    # supported shapes:
-    # - emit(**fields)
-    # - publish(mapping_or_dict)
-    def emit(self, **kwargs: Any) -> None: ...
-    def publish(self, event: Mapping[str, Any]) -> None: ...
-
-
-class IdsLike(Protocol):
-    # supported shapes (we probe in order)
-    def event_id(self) -> str: ...
-    def new_event_id(self) -> str: ...
-    def next_id(self) -> str: ...
-
-
-# ----------------------------
 # Internal helpers
 # ----------------------------
-
-
-def _events_write(events: Any, payload: dict[str, Any]) -> None:
-    """
-    Write an event using either:
-      - events.emit(**payload)
-      - events.publish(payload)
-    """
-    if hasattr(events, "emit"):
-        events.emit(**payload)
-        return
-    if hasattr(events, "publish"):
-        events.publish(payload)
-        return
-    raise TypeError("events must provide emit(**kwargs) or publish(mapping)")
-
-
-def _new_event_id(ids: Any) -> str:
-    """
-    Deterministic ID generation should come from your ids service.
-    We probe common method names.
-    """
-    for name in ("event_id", "new_event_id"):
-        if hasattr(ids, name):
-            fn = getattr(ids, name)
-            return str(fn())
-
-    # IdsService uses next_id(prefix)
-    if hasattr(ids, "next_id"):
-        fn = ids.next_id
-        try:
-            return str(fn("evt"))
-        except TypeError:
-            return str(fn())
-    raise TypeError("ids must provide event_id() or new_event_id() or next_id()")
 
 
 def _sample_inter_page_delay_s(cfg: InterPageTimeConfig, rng: Any) -> float:
@@ -139,10 +75,9 @@ def _sample_inter_page_delay_s(cfg: InterPageTimeConfig, rng: Any) -> float:
 
 
 class SessionsService:
-    """
-    Spawns per-session SimPy processes that traverse the website graph.
+    """Spawns per-session SimPy processes that traverse the website graph.
 
-    Emits:
+    Emits via EventsEmitter:
       - session_start
       - page_view (one per visited page)
       - drop_off (if page dropoff triggers)
@@ -157,19 +92,15 @@ class SessionsService:
         self,
         *,
         env: Any,
-        graph: WebsiteGraphLike,
-        rng: RNGLike,
-        events: EventsLike,
-        ids: IdsLike,
-        run_id: str,
+        graph: WebsiteGraph,
+        rng: RNG,
+        events: EventsEmitter,
         cfg: SessionsConfig,
     ) -> None:
         self.env = env
         self.graph = graph
         self.rng = rng
         self.events = events
-        self.ids = ids
-        self.run_id = run_id
         self.cfg = cfg
 
     def spawn(
@@ -186,12 +117,16 @@ class SessionsService:
         conversion_logit_shift: float = 0.0,
     ) -> Any:
         page0 = entry_page or self.cfg.entry_page
+
+        # Enforce channel for session-scoped events. Baseline traffic is "direct".
+        channel_out = channel or "direct"
+
         return self.env.process(
             self._run_session(
                 user_id=user_id,
                 session_id=session_id,
                 intent_source=intent_source,
-                channel=channel,
+                channel=channel_out,
                 entry_page=page0,
                 conversion=conversion,
                 user_propensity=user_propensity,
@@ -206,30 +141,24 @@ class SessionsService:
         event_type: str,
         user_id: str,
         session_id: str,
-        intent_source: str | None = None,
-        channel: str | None = None,
+        intent_source: str | None,
+        channel: str,
         page: str | None = None,
         value_num: float | None = None,
         value_str: str | None = None,
-        payload_json: str | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> None:
-        ts_utc = self.graph.get_current_time()
-        payload: dict[str, Any] = {
-            "run_id": self.run_id,
-            "event_id": _new_event_id(self.ids),
-            "ts_utc": ts_utc,
-            "sim_time_s": float(self.env.now),
-            "user_id": user_id,
-            "session_id": session_id,
-            "event_type": event_type,
-            "intent_source": intent_source,
-            "channel": channel,
-            "page": page,
-            "value_num": value_num,
-            "value_str": value_str,
-            "payload_json": payload_json,
-        }
-        _events_write(self.events, payload)
+        self.events.emit(
+            event_type,
+            user_id=user_id,
+            session_id=session_id,
+            intent_source=intent_source,
+            channel=channel,
+            page=page,
+            value_num=value_num,
+            value_str=value_str,
+            payload=payload,
+        )
 
     def _run_session(
         self,
@@ -237,7 +166,7 @@ class SessionsService:
         user_id: str,
         session_id: str,
         intent_source: str | None,
-        channel: str | None,
+        channel: str,
         entry_page: str,
         conversion: ConversionService | None,
         user_propensity: float | None,
@@ -259,14 +188,8 @@ class SessionsService:
         current: str | None = entry_page
         steps = 0
 
-        def _under_step_cap() -> bool:
-            if max_steps is None:
-                return True
-            return steps < int(max_steps)
-
-        while current is not None and _under_step_cap():
-            steps += 1
-
+        while current is not None:
+            # page view (entry page is counted as a view)
             self._emit(
                 event_type="page_view",
                 user_id=user_id,
@@ -274,19 +197,28 @@ class SessionsService:
                 intent_source=intent_source,
                 channel=channel,
                 page=current,
-                value_num=float(steps),
             )
+            steps += 1
 
-            # Drop-off
+            # max steps cap
+            if max_steps is not None and steps >= int(max_steps):
+                self._emit(
+                    event_type="session_end",
+                    user_id=user_id,
+                    session_id=session_id,
+                    intent_source=intent_source,
+                    channel=channel,
+                    page=current,
+                    value_str="max_steps",
+                )
+                return
+
+            # page-level dropoff
             page_obj = self.graph.get_page(current)
-            dropoff_p = 0.0
-            if page_obj is not None and hasattr(page_obj, "dropoff_p"):
-                dropoff_p = float(page_obj.dropoff_p or 0.0)
+            drop_p = float(getattr(page_obj, "dropoff_p", 0.0)) if page_obj is not None else 0.0
+            drop_p = max(0.0, min(1.0, drop_p * float(dropoff_multiplier)))
 
-            if dropoff_multiplier != 1.0:
-                dropoff_p = max(0.0, min(1.0, float(dropoff_p) * float(dropoff_multiplier)))
-
-            if float(self.rng.random()) < dropoff_p:
+            if self.rng.random() < drop_p:
                 self._emit(
                     event_type="drop_off",
                     user_id=user_id,
@@ -294,7 +226,7 @@ class SessionsService:
                     intent_source=intent_source,
                     channel=channel,
                     page=current,
-                    value_num=dropoff_p,
+                    value_num=drop_p,
                 )
                 self._emit(
                     event_type="session_end",
@@ -304,18 +236,17 @@ class SessionsService:
                     channel=channel,
                     page=current,
                     value_str="drop_off",
-                    value_num=float(steps),
                 )
                 return
 
-            # Conversion (at most once per session)
+            # conversion check (optional)
             if conversion is not None:
-                prop = 0.5 if user_propensity is None else float(user_propensity)
                 did_convert, p_conv = conversion.should_convert(
-                    propensity=prop,
-                    logit_shift=float(conversion_logit_shift),
                     rng=self.rng,
+                    propensity=float(user_propensity) if user_propensity is not None else 0.0,
+                    logit_shift=float(conversion_logit_shift),
                 )
+
                 if did_convert:
                     self._emit(
                         event_type="conversion",
@@ -326,42 +257,13 @@ class SessionsService:
                         page=current,
                         value_num=float(p_conv),
                     )
-                    self._emit(
-                        event_type="session_end",
-                        user_id=user_id,
-                        session_id=session_id,
-                        intent_source=intent_source,
-                        channel=channel,
-                        page=current,
-                        value_str="conversion",
-                        value_num=float(steps),
-                    )
-                    return
 
-            # Inter-page time + timeout
-            delay_s = _sample_inter_page_delay_s(self.cfg.inter_page_time, self.rng)
-            if timeout_s > 0 and delay_s > timeout_s:
-                yield self.env.timeout(timeout_s)
-                self._emit(
-                    event_type="session_end",
-                    user_id=user_id,
-                    session_id=session_id,
-                    intent_source=intent_source,
-                    channel=channel,
-                    page=current,
-                    value_str="timeout",
-                    value_num=float(steps),
-                )
-                return
-
-            if delay_s > 0:
-                yield self.env.timeout(delay_s)
-
-            # Transition (support both signatures)
+            # select next page
             try:
                 nxt = self.graph.next_page(current, self.rng)
             except TypeError:
                 nxt = self.graph.next_page(current)
+
             if nxt is None:
                 self._emit(
                     event_type="session_end",
@@ -371,32 +273,23 @@ class SessionsService:
                     channel=channel,
                     page=current,
                     value_str="no_next_page",
-                    value_num=float(steps),
                 )
                 return
 
+            # delay to next interaction
+            delay_s = float(_sample_inter_page_delay_s(self.cfg.inter_page_time, self.rng))
+            if delay_s > timeout_s:
+                yield self.env.timeout(timeout_s)
+                self._emit(
+                    event_type="session_end",
+                    user_id=user_id,
+                    session_id=session_id,
+                    intent_source=intent_source,
+                    channel=channel,
+                    page=current,
+                    value_str="timeout",
+                )
+                return
+
+            yield self.env.timeout(delay_s)
             current = nxt
-
-        if max_steps is not None and steps >= int(max_steps):
-            self._emit(
-                event_type="session_end",
-                user_id=user_id,
-                session_id=session_id,
-                intent_source=intent_source,
-                channel=channel,
-                page=current,
-                value_str="max_steps",
-                value_num=float(steps),
-            )
-            return
-
-        self._emit(
-            event_type="session_end",
-            user_id=user_id,
-            session_id=session_id,
-            intent_source=intent_source,
-            channel=channel,
-            page=current,
-            value_str="ended",
-            value_num=float(steps),
-        )

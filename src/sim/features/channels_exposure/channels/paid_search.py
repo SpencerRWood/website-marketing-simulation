@@ -7,7 +7,6 @@ import simpy
 from sim.features.channels_exposure.channels.base import (
     Channel,
     _pick_user_id,
-    _poisson_knuth,
     _schedule_at,
 )
 from sim.features.channels_exposure.types import ChannelConfig, DeliveryPlan
@@ -32,57 +31,41 @@ class PaidSearchChannel(Channel):
         day_start_s: float,
         seconds_per_day: float,
         user_ids: list[str],
-        emit_exposure: callable,
-        emit_click: callable,
-        emit_intent: callable,
+        emit_exposure,
+        emit_click,
+        emit_intent,
         rng,
     ) -> None:
-        p = self.cfg.params or {}
+        rate = float(self.cfg.exposure_rate_per_user_per_day)
+        rate = max(0.0, rate)
 
-        in_market_share = float(p.get("in_market_share_per_day", 1.0))
-        freq_cap = int(p.get("freq_cap_per_user_per_day", 10_000))
-
-        brand_share = float(p.get("brand_share", 0.0))
-        brand_mult = float(p.get("brand_ctr_multiplier", 1.0))
-        nonbrand_mult = float(p.get("nonbrand_ctr_multiplier", 1.0))
-
-        incremental_click_share = float(p.get("incremental_click_share", 1.0))
-
-        lam = float(self.cfg.exposure_rate_per_user_per_day)
-        base_ctr = float(self.cfg.click_through_rate)
-        channel_name = self.cfg.name
+        # interpret as "at most one exposure per user per day"
+        p_expose = 1.0 if rate >= 1.0 else rate
 
         for user_id in user_ids:
-            if float(rng.random()) >= in_market_share:
+            # gating: does this user get an exposure today?
+            if rng.random() >= p_expose:
                 continue
 
-            n = _poisson_knuth(rng, lam)
-            if n > freq_cap:
-                n = freq_cap
+            # schedule exposure time uniformly within the day
+            t = day_start_s + rng.random() * float(seconds_per_day)
 
-            for _ in range(n):
-                at_s = float(day_start_s) + float(rng.random()) * float(seconds_per_day)
+            def _proc(u: str, *, t_s: float = t) -> simpy.events.Event:
+                # wait until scheduled time
+                yield env.timeout(max(0.0, t_s - float(env.now)))
 
-                is_brand = float(rng.random()) < brand_share
-                ctr = base_ctr * (brand_mult if is_brand else nonbrand_mult)
+                emit_exposure(user_id=u, channel=self.cfg.name, campaign_id=None)
 
-                env.process(
-                    _paid_search_exposure(
-                        env=env,
-                        at_s=at_s,
-                        user_id=user_id,
-                        channel_name=channel_name,
-                        ctr=ctr,
-                        incremental_click_share=incremental_click_share
-                        if bool(self.cfg.incremental_intent)
-                        else 0.0,
-                        campaign_id=None,
-                        emit_exposure=emit_exposure,
-                        emit_click=emit_click,
-                        emit_intent=emit_intent,
-                        rng=rng,
-                    )
-                )
+                # click
+                if rng.random() < float(self.cfg.click_through_rate):
+                    emit_click(user_id=u, channel=self.cfg.name, campaign_id=None)
+
+                    # incremental intent
+                    if bool(self.cfg.incremental_intent):
+                        emit_intent(user_id=u, channel=self.cfg.name, campaign_id=None)
+
+            # IMPORTANT: actually schedule the process
+            env.process(_proc(user_id))
 
     def schedule_from_delivery_plan(
         self,

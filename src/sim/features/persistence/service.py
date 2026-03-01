@@ -12,9 +12,7 @@ from .duckdb_adapter import DuckDBAdapter
 
 @dataclass(frozen=True)
 class Event:
-    """
-    Minimal event contract. If you already have an Event type, replace this import.
-    """
+    """Legacy in-memory event type (kept for backwards compatibility)."""
 
     run_id: str
     event_id: str
@@ -35,8 +33,11 @@ class Event:
 
 
 class PersistenceService:
-    """
-    Buffered event sink + flush policy.
+    """Buffered event sink + flush policy.
+
+    This service is the *cold* layer boundary. Features should not call it directly.
+    Only the events feature should depend on `.append(row)`.
+
     - Hot: buffer in memory
     - Cold: DuckDB
     """
@@ -52,7 +53,8 @@ class PersistenceService:
         self.every_n_events = int(every_n_events)
         self.or_every_seconds = float(or_every_seconds)
 
-        self._buf: list[Event] = []
+        # Internal buffer holds tuples already shaped for DuckDBAdapter.write_events(...)
+        self._buf_rows: list[tuple] = []
         self._logger = get_logger(__name__)
 
         self._is_open = False
@@ -64,25 +66,34 @@ class PersistenceService:
         self.adapter.open()
         self._is_open = True
 
-    def emit(self, e: Event) -> None:
+    # ------------------------------------------------------------------
+    # Canonical API used by sim.features.events
+    # ------------------------------------------------------------------
+    def append(self, row: dict[str, Any]) -> None:
+        """Append a single canonical event row (dict) to the buffer."""
         if not self._is_open:
             raise RuntimeError("PersistenceService not open. Call open() during bootstrap.")
 
-        self._buf.append(e)
+        self._buf_rows.append(self._rowdict_to_tuple(row))
 
-        if self.every_n_events > 0 and len(self._buf) >= self.every_n_events:
+        if self.every_n_events > 0 and len(self._buf_rows) >= self.every_n_events:
             self.flush(reason="count")
 
+    # ------------------------------------------------------------------
+    # Legacy API (kept so older adapters/tests don't immediately break)
+    # ------------------------------------------------------------------
+    def emit(self, e: Event) -> None:
+        self.append(self._event_to_rowdict(e))
+
     def flush(self, *, reason: str) -> None:
-        if not self._buf:
+        if not self._buf_rows:
             return
 
-        rows = [self._event_to_row(e) for e in self._buf]
-        self._buf.clear()
+        rows = list(self._buf_rows)
+        self._buf_rows.clear()
 
         result = self.adapter.write_events(rows)
 
-        # Structured log (no wall-clock timestamps for determinism; duration is ok)
         self._logger.info(
             "flush",
             extra={
@@ -95,16 +106,11 @@ class PersistenceService:
         )
 
     def close(self) -> None:
-        # final flush
         self.flush(reason="shutdown")
         self.adapter.close()
         self._is_open = False
 
     def start_periodic_flush(self, env) -> None:
-        """
-        Start a SimPy process that flushes every `or_every_seconds`.
-        Call once during bootstrap after env is created.
-        """
         if self._periodic_proc_started:
             return
         self._periodic_proc_started = True
@@ -115,21 +121,46 @@ class PersistenceService:
             yield env.timeout(self.or_every_seconds)
             self.flush(reason="timer")
 
+    # ------------------------------------------------------------------
+    # Row shaping
+    # ------------------------------------------------------------------
     @staticmethod
-    def _event_to_row(e: Event) -> tuple:
-        payload_json = json.dumps(e.payload, separators=(",", ":")) if e.payload else None
+    def _event_to_rowdict(e: Event) -> dict[str, Any]:
+        return {
+            "run_id": e.run_id,
+            "event_id": e.event_id,
+            "ts_utc": e.ts_utc,
+            "sim_time_s": float(e.sim_time_s),
+            "user_id": e.user_id,
+            "session_id": e.session_id,
+            "event_type": e.event_type,
+            "intent_source": e.intent_source,
+            "channel": e.channel,
+            "page": e.page,
+            "value_num": e.value_num,
+            "value_str": e.value_str,
+            "payload_json": json.dumps(
+                e.payload, sort_keys=True, separators=(",", ":"), default=str
+            )
+            if e.payload
+            else None,
+        }
+
+    @staticmethod
+    def _rowdict_to_tuple(row: dict[str, Any]) -> tuple:
+        # DuckDBAdapter.write_events expects this exact order.
         return (
-            e.run_id,
-            e.event_id,
-            e.ts_utc,
-            float(e.sim_time_s),
-            e.user_id,
-            e.session_id,
-            e.event_type,
-            e.intent_source,
-            e.channel,
-            e.page,
-            e.value_num,
-            e.value_str,
-            payload_json,
+            row.get("run_id"),
+            row.get("event_id"),
+            row.get("ts_utc"),
+            float(row.get("sim_time_s")) if row.get("sim_time_s") is not None else None,
+            row.get("user_id"),
+            row.get("session_id"),
+            row.get("event_type"),
+            row.get("intent_source"),
+            row.get("channel"),
+            row.get("page"),
+            row.get("value_num"),
+            row.get("value_str"),
+            row.get("payload_json"),
         )

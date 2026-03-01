@@ -5,27 +5,21 @@ from datetime import datetime
 from typing import Any
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True, frozen=True)
 class SessionIntent:
     """
-    A single website-arrival signal that should be resolved into a concrete session.
+    Canonical intent message passed on the hot intent bus.
 
-    Option B-ready:
-      - audience_id identifies the person in the marketing audience universe
-      - channel is the channel name when intent_source is channel:<name>
+    intent_id: deterministic ID from IdsService (intent scope).
+    ts_utc: authoritative UTC wall-clock timestamp (from WebsiteGraph clock).
+    sim_time_s: sim time in seconds since env start (env.now).
     """
 
     intent_id: str
     ts_utc: datetime
+    sim_time_s: float
 
-    # "baseline" OR "channel:<name>"
     intent_source: str
-
-    # Convenience for downstream filtering; can be redundant with intent_source.
     channel: str | None = None
-
-    # Identity in the addressable audience universe (not yet a site user)
     audience_id: str | None = None
-
-    # Freeform metadata (e.g., campaign_id, creative_id, placement, etc.)
     payload: dict[str, Any] | None = None

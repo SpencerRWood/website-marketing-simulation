@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+# Keep this list tight; expand deliberately as you add features.
 ALLOWED_EVENT_TYPES: set[str] = {
-    # Marketing touches (if you keep them)
+    # upstream drivers
+    "session_intent",
+    "user_created",
+    # marketing touches
     "exposure",
     "click",
-    # Session lifecycle + navigation
+    # session lifecycle + navigation
     "session_start",
     "page_view",
     "drop_off",
     "conversion",
     "session_end",
+    # run lifecycle (optional but useful for smoke tests)
+    "run_started",
+    "run_finished",
 }
 
 # Events that are expected to be tied to a session process
@@ -39,18 +47,17 @@ class Event:
     user_id: str | None = None
     session_id: str | None = None
 
-    # Single acquisition dimension:
-    # - baseline traffic: "direct"
-    # - channel traffic: channel name, e.g. "search"
+    intent_source: str | None = None
     channel: str | None = None
-
     page: str | None = None
+
+    value_num: float | None = None
+    value_str: str | None = None
+
     payload_json: str | None = None
 
     def as_row(self) -> dict[str, Any]:
-        """
-        Canonical DuckDB row representation matching your events table columns.
-        """
+        """Canonical DuckDB row representation matching persistence schema."""
         return {
             "run_id": self.run_id,
             "event_id": self.event_id,
@@ -59,14 +66,17 @@ class Event:
             "user_id": self.user_id,
             "session_id": self.session_id,
             "event_type": self.event_type,
+            "intent_source": self.intent_source,
             "channel": self.channel,
             "page": self.page,
+            "value_num": self.value_num,
+            "value_str": self.value_str,
             "payload_json": self.payload_json,
         }
 
 
-def json_dumps(payload: dict[str, Any] | None) -> str | None:
+def json_dumps(payload: Mapping[str, Any] | None) -> str | None:
     if payload is None:
         return None
     # Stable JSON for deterministic outputs/diffs
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return json.dumps(dict(payload), sort_keys=True, separators=(",", ":"), default=str)
