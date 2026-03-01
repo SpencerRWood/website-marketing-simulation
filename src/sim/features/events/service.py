@@ -11,7 +11,8 @@ from sim.features.events.schema import (
     Event,
     json_dumps,
 )
-from sim.features.site_graph.service import WebsiteGraph
+from sim.features.events.types import EventsEmitter
+from sim.features.site_graph.types import WebsiteGraph
 
 
 class IdGenerator(Protocol):
@@ -19,19 +20,14 @@ class IdGenerator(Protocol):
 
 
 class PersistenceSink(Protocol):
-    """
-    Minimal surface area the events feature needs.
-    Adapt your existing PersistenceService to expose `.append(row: dict)`.
-    """
+    """Minimal surface area the events feature needs."""
 
     def append(self, row: dict[str, Any]) -> None: ...
 
 
 @dataclass(slots=True)
 class CounterEventIdGenerator:
-    """
-    Deterministic, monotonic event ids scoped to a run.
-    """
+    """Deterministic, monotonic event ids scoped to a run."""
 
     run_id: str
     counter: int = 0
@@ -41,7 +37,14 @@ class CounterEventIdGenerator:
         return f"{self.run_id}_{self.counter:08d}"
 
 
-class EventService:
+class EventService(EventsEmitter):
+    """Canonical event emitter.
+
+    - Stamps: run_id, event_id, ts_utc, sim_time_s
+    - Enforces: basic event contracts
+    - Routes: to PersistenceService via .append(row)
+    """
+
     def __init__(
         self,
         *,
@@ -65,36 +68,33 @@ class EventService:
 
     def emit(
         self,
-        *,
         event_type: str,
+        *,
         user_id: str | None = None,
         session_id: str | None = None,
+        intent_source: str | None = None,
         channel: str | None = None,
         page: str | None = None,
+        value_num: float | None = None,
+        value_str: str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> Event:
-        """
-        Emits a single behavioral event into cold storage via the persistence buffer.
-
-        Contracts enforced:
-        - event_type must be in ALLOWED_EVENT_TYPES
-        - If session_id is present, channel must be present (persist origin channel across the session)
-        - For baseline sessions, use channel="direct"
-        """
         if event_type not in ALLOWED_EVENT_TYPES:
             raise ValueError(
-                f"Unsupported event_type={event_type!r}. " f"Allowed={sorted(ALLOWED_EVENT_TYPES)}"
+                f"Unsupported event_type={event_type!r}. Allowed={sorted(ALLOWED_EVENT_TYPES)}"
             )
 
+        # Session-scoped events must have session_id
+        if event_type in SESSION_SCOPED_EVENT_TYPES and session_id is None:
+            raise ValueError(f"{event_type} requires session_id")
+
+        # If a session_id is present, channel must be present (persist origin channel across session)
         if session_id is not None and channel is None:
             raise ValueError(
                 "channel must be provided when session_id is set "
-                "(persist origin channel across session events)."
+                "(persist origin channel across session events). "
+                "For baseline sessions, use channel='direct'."
             )
-
-        # Optional: strengthen discipline further
-        if event_type in SESSION_SCOPED_EVENT_TYPES and session_id is None:
-            raise ValueError(f"{event_type} requires session_id")
 
         event = Event(
             run_id=self._run_id,
@@ -104,8 +104,11 @@ class EventService:
             event_type=event_type,
             user_id=user_id,
             session_id=session_id,
+            intent_source=intent_source,
             channel=channel,
             page=page,
+            value_num=value_num,
+            value_str=value_str,
             payload_json=json_dumps(payload),
         )
 
@@ -114,14 +117,14 @@ class EventService:
         if self._logger is not None:
             self._logger.info(
                 "event_emitted",
-                event_type=event.event_type,
-                run_id=event.run_id,
-                event_id=event.event_id,
-                sim_time_s=event.sim_time_s,
-                user_id=event.user_id,
-                session_id=event.session_id,
-                channel=event.channel,
-                page=event.page,
+                extra={
+                    "run_id": event.run_id,
+                    "event_type": event.event_type,
+                    "event_id": event.event_id,
+                    "sim_time_s": event.sim_time_s,
+                    "user_id": event.user_id,
+                    "session_id": event.session_id,
+                    "channel": event.channel,
+                    "page": event.page,
+                },
             )
-
-        return event

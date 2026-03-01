@@ -2,19 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sim.core.ids import IdsService
+from sim.core.rng import RNG
 from sim.features.arrivals.models.nhpp import (
     GaussianPeakCurveConfig,
     NHPPBaselineArrivalsConfig,
     NHPPBaselineArrivalsModel,
 )
-from sim.features.arrivals.types import (
-    ArrivalModel,
-    EventsLike,
-    IdsLike,
-    IntentBusLike,
-    RngLike,
-    WebsiteGraphLike,
-)
+from sim.features.arrivals.types import ArrivalModel
+from sim.features.events.service import EventService
+from sim.features.session_intent.service import SessionIntentService
+from sim.features.site_graph.service import WebsiteGraph
 
 
 @dataclass(frozen=True)
@@ -41,13 +39,13 @@ class ArrivalsService:
         self,
         *,
         run_id: str,
-        rng: RngLike,
-        ids: IdsLike,
-        graph: WebsiteGraphLike,
-        intent_bus: IntentBusLike,
+        rng: RNG,
+        ids: IdsService,
+        graph: WebsiteGraph,
+        intent_bus: SessionIntentService,
         baseline_arrivals: BaselineArrivalsConfig,
         num_days: int,
-        events: EventsLike | None = None,
+        events: EventService | None = None,
         grid_minutes: int = 1,
     ) -> None:
         self.run_id = run_id

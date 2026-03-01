@@ -43,6 +43,7 @@ class SessionIntentService:
         return SessionIntent(
             intent_id=intent_id,
             ts_utc=ts_utc,
+            sim_time_s=float(self.env.now),
             intent_source=intent_source,
             channel=channel,
             audience_id=audience_id,

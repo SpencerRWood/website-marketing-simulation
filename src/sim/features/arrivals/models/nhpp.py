@@ -4,15 +4,13 @@ import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sim.features.arrivals.types import (
-    ArrivalModel,
-    EventsLike,
-    IdsLike,
-    IntentBusLike,
-    RngLike,
-    SessionIntent,
-    WebsiteGraphLike,
-)
+from sim.core.ids import IdsService
+from sim.core.rng import RNG
+from sim.features.arrivals.types import ArrivalModel
+from sim.features.events.service import EventService
+from sim.features.session_intent.service import SessionIntentService
+from sim.features.session_intent.types import SessionIntent
+from sim.features.site_graph.service import WebsiteGraph  # adjust path to your canonical class
 
 SECONDS_PER_DAY = 24 * 60 * 60
 
@@ -94,13 +92,13 @@ class NHPPBaselineArrivalsModel(ArrivalModel):
         self,
         *,
         run_id: str,
-        rng: RngLike,
-        ids: IdsLike,
-        graph: WebsiteGraphLike,
-        intent_bus: IntentBusLike,
+        rng: RNG,
+        ids: IdsService,
+        graph: WebsiteGraph,
+        intent_bus: SessionIntentService,
         cfg: NHPPBaselineArrivalsConfig,
         num_days: int,
-        events: EventsLike | None = None,
+        events: EventService | None = None,
         grid_minutes: int = 1,
     ) -> None:
         if num_days <= 0:
@@ -174,10 +172,7 @@ class NHPPBaselineArrivalsModel(ArrivalModel):
 
                     if self.events is not None:
                         self.events.emit(
-                            run_id=self.run_id,
-                            event_type="session_intent",
-                            ts_utc=intent.ts_utc,
-                            sim_time_s=intent.sim_time_s,
+                            "session_intent",
                             intent_source=intent.intent_source,
                             channel=intent.channel,
                             payload={

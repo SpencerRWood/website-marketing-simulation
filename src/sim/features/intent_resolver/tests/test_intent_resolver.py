@@ -59,8 +59,8 @@ class DummyUsers:
 class RecordingSink:
     events: list[dict[str, Any]]
 
-    def emit(self, **kwargs) -> None:
-        self.events.append(dict(kwargs))
+    def emit(self, event_type: str, **kwargs) -> None:
+        self.events.append({"event_type": event_type, **kwargs})
 
 
 @dataclass
@@ -69,7 +69,6 @@ class RecordingSessionRunner:
 
     def start_session(self, *, user_id: str, session_id: str, intent):
         self.started.append((user_id, session_id, intent))
-        # No actual process required for these tests
         return None
 
 
@@ -106,10 +105,14 @@ def test_resolver_creates_user_when_empty_and_spawns_session() -> None:
 
     assert users.num_users() == 1
     assert len(runner.started) == 1
-    assert len(sink.events) >= 2  # session_intent + session_start (and possibly user_created)
+
+    types = [e["event_type"] for e in sink.events]
+    assert "session_intent" in types
+    assert "session_start" in types
+    assert "user_created" in types
 
 
-def test_resolver_selects_existing_when_new_user_share_zero() -> None:
+def test_resolver_selects_existing_and_spawns_session() -> None:
     env = simpy.Environment()
     ids = DummyIds()
     rng = random.Random(42)
@@ -137,8 +140,11 @@ def test_resolver_selects_existing_when_new_user_share_zero() -> None:
 
     assert users.num_users() == 2
     assert len(runner.started) == 1
-    # picked from existing pool
     assert runner.started[0][0] in {"user_a", "user_b"}
+
+    # For channel intents, session events should carry channel
+    session_start = next(e for e in sink.events if e["event_type"] == "session_start")
+    assert session_start["channel"] == "direct" or session_start["channel"] == "search"
 
 
 def test_resolver_disabled_emits_nothing_and_spawns_nothing() -> None:

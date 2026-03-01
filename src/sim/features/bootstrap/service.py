@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 import simpy
@@ -15,20 +14,79 @@ from sim.core.types import RunContext
 from sim.features.arrivals.models.nhpp import GaussianPeakCurveConfig
 from sim.features.arrivals.service import ArrivalsService, BaselineArrivalsConfig
 from sim.features.conversion.service import ConversionConfig, ConversionService
+from sim.features.events.service import EventService
 from sim.features.intent_resolver.service import IntentResolverService
 from sim.features.intent_resolver.types import IntentResolverConfig
 from sim.features.persistence.duckdb_adapter import DuckDBAdapter
-from sim.features.persistence.service import Event, PersistenceService
+from sim.features.persistence.service import PersistenceService
 from sim.features.session_intent.service import SessionIntentService
 from sim.features.sessions.service import InterPageTimeConfig, SessionsConfig, SessionsService
 from sim.features.site_graph.service import SiteGraphFactory
-from sim.features.users_state.service import UsersConfig, UsersStateService
+from sim.features.site_graph.types import WebsiteGraph
+from sim.features.users_state.service import (
+    DiscoveryModeConfig,
+    PropensityInitConfig,
+    UsersConfig,
+    UsersSelectionConfig,
+    UsersStateService,
+)
 
 
 @dataclass(frozen=True)
 class BootstrapResult:
     ctx: RunContext
     duckdb_path: str
+
+
+class _IdsEventIdAdapter:
+    """Adapts IdsService to the events feature IdGenerator protocol."""
+
+    def __init__(self, ids: IdsService) -> None:
+        self._ids = ids
+
+    def next_event_id(self) -> str:
+        return str(self._ids.next_id("evt"))
+
+
+def _build_graph(
+    *, env: simpy.Environment, raw: dict[str, Any], start_dt_utc: datetime, rng: RNG
+) -> WebsiteGraph:
+    sg_factory = SiteGraphFactory(strict=False)
+    cfg_site = raw.get("site_graph") if isinstance(raw, dict) else None
+    return sg_factory.build(env=env, cfg_site_graph=cfg_site, start_dt=start_dt_utc, rng=rng)
+
+
+def _parse_users_config(raw: dict[str, Any]) -> UsersConfig:
+    u_raw = raw.get("users") or {}
+
+    sel_raw = u_raw.get("selection") or {}
+    disc_raw = u_raw.get("discovery_mode") or {}
+
+    # Back-compat: some older configs used users.propensity.init.*
+    prop_init_raw = (
+        u_raw.get("propensity_init") or (u_raw.get("propensity") or {}).get("init") or {}
+    )
+
+    return UsersConfig(
+        new_user_share=float(u_raw.get("new_user_share", 0.6)),
+        selection=UsersSelectionConfig(
+            mode=str(sel_raw.get("mode", "recency_propensity_weighted")),
+            recency_half_life_hours=float(sel_raw.get("recency_half_life_hours", 18.0)),
+            propensity_weight=float(sel_raw.get("propensity_weight", 0.5)),
+            recency_weight=float(sel_raw.get("recency_weight", 0.5)),
+        ),
+        propensity_init=PropensityInitConfig(
+            dist=str(prop_init_raw.get("dist", "uniform")),
+            alpha=float(prop_init_raw.get("alpha", 2.0)),
+            beta=float(prop_init_raw.get("beta", 6.0)),
+        ),
+        discovery_mode=DiscoveryModeConfig(
+            enabled=bool(disc_raw.get("enabled", True)),
+            graduation_sessions=int(disc_raw.get("graduation_sessions", 2)),
+            dropoff_multiplier=float(disc_raw.get("dropoff_multiplier", 1.25)),
+            conversion_logit_shift=float(disc_raw.get("conversion_logit_shift", -0.8)),
+        ),
+    )
 
 
 def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> BootstrapResult:
@@ -56,97 +114,86 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
     persistence.open()
     persistence.start_periodic_flush(env)
 
-    # ------------------------------------------------------------------------------
-    # Event sink used by IntentResolverService: MUST match its EventSink Protocol:
-    #   emit(*, ts_utc, sim_time_s, event_type, user_id?, session_id?, intent_id?,
-    #        intent_source?, channel?, audience_id?, payload?)
-    # ------------------------------------------------------------------------------
-    class ResolverEventSink:
-        def emit(
-            self,
-            *,
-            ts_utc: datetime,
-            sim_time_s: float,
-            event_type: str,
-            user_id: str | None = None,
-            session_id: str | None = None,
-            intent_id: str | None = None,
-            intent_source: str | None = None,
-            channel: str | None = None,
-            audience_id: str | None = None,
-            payload: dict[str, Any] | None = None,
-        ) -> None:
-            # We store intent_id/audience_id in payload so we don't need schema changes.
-            payload_out = payload or {}
-            if intent_id is not None:
-                payload_out = dict(payload_out)
-                payload_out["intent_id"] = intent_id
-            if audience_id is not None:
-                payload_out = dict(payload_out)
-                payload_out["audience_id"] = audience_id
+    # ----- website graph (authoritative clock) -----
+    graph = _build_graph(env=env, raw=raw, start_dt_utc=start_dt_utc, rng=rng)
 
-            persistence.emit(
-                Event(
-                    run_id=ctx.run_id,
-                    event_id=ids.next_id("evt"),
-                    ts_utc=ts_utc,
-                    sim_time_s=sim_time_s,
-                    event_type=event_type,
-                    user_id=user_id,
-                    session_id=session_id,
-                    intent_source=intent_source,
-                    channel=channel,
-                    page=None,
-                    value_num=None,
-                    value_str=None,
-                    payload=payload_out if payload_out else None,
-                )
-            )
+    # ----- canonical event service -----
+    events = EventService(
+        env=env,
+        graph=graph,
+        persistence=persistence,
+        ids=_IdsEventIdAdapter(ids),
+        run_id=ctx.run_id,
+        logger=logger,
+    )
 
-    sink = ResolverEventSink()
+    try:
+        # ----- users hot state -----
+        users_cfg = _parse_users_config(raw)
+        users = UsersStateService(cfg=users_cfg)
 
-    # ----- users hot state -----
-    users_cfg = getattr(cfg, "users", None)
-    if users_cfg is None:
-        users_cfg = UsersConfig()
-    users = UsersStateService(cfg=users_cfg)
+        # ----- session intents store -----
+        session_intents = SessionIntentService(env=env, ids=ids, capacity=None)
 
-    # ----- session intents store -----
-    session_intents = SessionIntentService(env=env, ids=ids, capacity=None)
+        # Arrivals expects an intent bus with publish(intent)
+        class IntentBusAdapter:
+            def __init__(self, bus: SessionIntentService) -> None:
+                self._bus = bus
 
-    # Arrivals expects an intent bus with publish(intent)
-    class IntentBusAdapter:
-        def __init__(self, bus: SessionIntentService) -> None:
-            self._bus = bus
-
-        def publish(self, intent) -> None:
-            # Your publish_new does NOT accept intent_id; only pass supported kwargs.
-            try:
+            def publish(self, intent) -> None:
                 self._bus.publish_new(
                     ts_utc=intent.ts_utc,
                     intent_source=intent.intent_source,
                     channel=intent.channel,
+                    audience_id=getattr(intent, "audience_id", None),
+                    payload=getattr(intent, "payload", None),
                 )
-            except TypeError:
-                self._bus.publish_new(ts_utc=intent.ts_utc, intent_source=intent.intent_source)
 
-    intent_bus = IntentBusAdapter(session_intents)
+        intent_bus = IntentBusAdapter(session_intents)
 
-    # ----- graph + sessions (only if configured) -----
-    sessions_svc: SessionsService | None = None
-    if "site_graph" in raw and "sessions" in raw:
-        sg_factory = SiteGraphFactory(strict=False)
-        graph = sg_factory.build(
-            env=env,
-            cfg_site_graph=raw.get("site_graph"),
-            start_dt=start_dt_utc,
-            rng=rng,  # <-- SiteGraphFactory expects RNG, not an adapter
-        )
+        # ----- arrivals (baseline intents) -----
+        if "arrivals" in raw:
+            a_raw = raw.get("arrivals") or {}
+            b_raw = a_raw.get("baseline_intents") or {}
+            curve_raw = b_raw.get("intraday_curve") or {}
+            baseline_cfg = BaselineArrivalsConfig(
+                model=str(b_raw.get("model", "nhpp")),
+                daily_expected_intents=float(b_raw.get("daily_expected_intents", 0.0)),
+                intraday_curve=GaussianPeakCurveConfig(
+                    peak_hour=float(curve_raw.get("peak_hour", 12.0)),
+                    spread_hours=float(curve_raw.get("spread_hours", 3.0)),
+                    floor=float(curve_raw.get("floor", 0.05)),
+                ),
+            )
+            arrivals = ArrivalsService(
+                run_id=ctx.run_id,
+                rng=rng,
+                ids=ids,
+                graph=graph,
+                intent_bus=intent_bus,
+                baseline_arrivals=baseline_cfg,
+                num_days=int(cfg.run.num_days),
+                events=events,
+            )
+            arrivals.start(env)
 
+        # ----- conversion -----
+        conversion: ConversionService | None = None
+        if "conversion" in raw:
+            c_raw = raw.get("conversion") or {}
+            conversion = ConversionService(
+                ConversionConfig(
+                    model=str(c_raw.get("model", "logistic")),
+                    cap=float(c_raw.get("cap", 0.35)),
+                    base_logit=float(c_raw.get("base_logit", -3.0)),
+                    propensity_coef=float(c_raw.get("propensity_coef", 2.0)),
+                )
+            )
+
+        # ----- sessions -----
         s_raw = raw.get("sessions") or {}
         ipt_raw = s_raw.get("inter_page_time") or {}
-
-        sess_cfg = SessionsConfig(
+        sessions_cfg = SessionsConfig(
             inactivity_timeout_minutes=float(s_raw.get("inactivity_timeout_minutes", 30.0)),
             max_steps=None
             if s_raw.get("max_steps", 12) is None
@@ -158,204 +205,70 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
                 mean_seconds=float(ipt_raw.get("mean_seconds", 10.0)),
             ),
         )
+        sessions_svc = SessionsService(
+            env=env, graph=graph, rng=rng, events=events, cfg=sessions_cfg
+        )
 
-        # SessionsService expects an EventsLike with emit(**kwargs) and publish(Mapping)
-        class SessionsEventsAdapter:
-            def emit(self, **kwargs: Any) -> None:
-                # This adapter writes directly to persistence using your events schema.
-                persistence.emit(
-                    Event(
-                        run_id=ctx.run_id,
-                        event_id=ids.next_id("evt"),
-                        ts_utc=kwargs["ts_utc"],
-                        sim_time_s=float(kwargs["sim_time_s"]),
-                        event_type=str(kwargs["event_type"]),
-                        user_id=kwargs.get("user_id"),
-                        session_id=kwargs.get("session_id"),
-                        intent_source=kwargs.get("intent_source"),
-                        channel=kwargs.get("channel"),
-                        page=kwargs.get("page"),
-                        value_num=kwargs.get("value_num"),
-                        value_str=kwargs.get("value_str"),
-                        payload=kwargs.get("payload"),
-                    )
+        # ----- session runner used by intent resolver -----
+        class RealSessionRunner:
+            def __init__(self, env_: simpy.Environment, sessions_: SessionsService) -> None:
+                self._env = env_
+                self._sessions = sessions_
+
+            def start_session(self, *, user_id: str, session_id: str, intent) -> Any:
+                return self._env.process(
+                    self._run(user_id=user_id, session_id=session_id, intent=intent)
                 )
 
-            def publish(self, event: Mapping[str, Any]) -> None:
-                # Protocol wants Mapping, not dict
-                self.emit(**dict(event))
+            def _run(self, *, user_id: str, session_id: str, intent):
+                u = users.get_user(user_id)
+                propensity = float(getattr(u, "propensity", 0.5)) if u is not None else 0.5
+                is_disc = bool(getattr(u, "discovery_mode", False)) if u is not None else False
 
-        sessions_events = SessionsEventsAdapter()
+                drop_mult = 1.0
+                logit_shift = 0.0
+                if is_disc and bool(users.cfg.discovery_mode.enabled):
+                    drop_mult = float(users.cfg.discovery_mode.dropoff_multiplier)
+                    logit_shift = float(users.cfg.discovery_mode.conversion_logit_shift)
 
-        sessions_svc = SessionsService(
+                channel_out = getattr(intent, "channel", None) or "direct"
+
+                proc = self._sessions.spawn(
+                    user_id=user_id,
+                    session_id=session_id,
+                    intent_source=getattr(intent, "intent_source", None),
+                    channel=channel_out,
+                    conversion=conversion,
+                    user_propensity=propensity,
+                    dropoff_multiplier=drop_mult,
+                    conversion_logit_shift=logit_shift,
+                )
+                yield proc
+                users.mark_session_end(user_id=user_id, now_utc=intent.ts_utc)
+
+        session_runner = RealSessionRunner(env, sessions_svc)
+
+        # ----- intent resolver -----
+        resolver = IntentResolverService(
             env=env,
-            graph=graph,
-            rng=rng,  # <-- Sessions RNGLike expects expovariate(lambd), RNG matches
-            events=sessions_events,
-            ids=ids,  # SessionsService handles next_id(prefix) internally
-            run_id=ctx.run_id,
-            cfg=sess_cfg,
+            cfg=IntentResolverConfig(enabled=True),
+            ids=ids,
+            rng=rng,
+            intents=session_intents,
+            users=users,
+            session_runner=session_runner,
+            sink=events,
         )
+        resolver.start()
 
-    # ----- conversion -----
-    conversion: ConversionService | None = None
-    if "conversion" in raw:
-        c_raw = raw.get("conversion") or {}
-        conversion = ConversionService(
-            ConversionConfig(
-                model=str(c_raw.get("model", "logistic")),
-                cap=float(c_raw.get("cap", 0.35)),
-                base_logit=float(c_raw.get("base_logit", -3.0)),
-                propensity_coef=float(c_raw.get("propensity_coef", 2.0)),
-            )
-        )
-
-    # ----- session runner used by intent resolver -----
-    class NoopSessionRunner:
-        def __init__(self, env_: simpy.Environment) -> None:
-            self._env = env_
-
-        def start_session(self, *, user_id: str, session_id: str, intent) -> Any:
-            return self._env.process(
-                self._run(user_id=user_id, session_id=session_id, intent=intent)
-            )
-
-        def _run(self, *, user_id: str, session_id: str, intent):
-            # Minimal end + user update
-            sink.emit(
-                ts_utc=intent.ts_utc,
-                sim_time_s=float(self._env.now),
-                event_type="session_end",
-                user_id=user_id,
-                session_id=session_id,
-                intent_id=getattr(intent, "intent_id", None),
-                intent_source=getattr(intent, "intent_source", None),
-                channel=getattr(intent, "channel", None),
-                audience_id=None,
-                payload=None,
-            )
-            users.mark_session_end(user_id=user_id, now_utc=intent.ts_utc)
-            yield self._env.timeout(0)
-
-    class RealSessionRunner:
-        def __init__(self, env_: simpy.Environment, sessions_: SessionsService) -> None:
-            self._env = env_
-            self._sessions = sessions_
-
-        def start_session(self, *, user_id: str, session_id: str, intent) -> Any:
-            return self._env.process(
-                self._run(user_id=user_id, session_id=session_id, intent=intent)
-            )
-
-        def _run(self, *, user_id: str, session_id: str, intent):
-            u = users.get_user(user_id)
-            propensity = float(getattr(u, "propensity", 0.5)) if u is not None else 0.5
-            is_disc = bool(getattr(u, "discovery_mode", False)) if u is not None else False
-
-            drop_mult = 1.0
-            logit_shift = 0.0
-            if is_disc and bool(getattr(users.cfg.discovery_mode, "enabled", False)):
-                drop_mult = float(users.cfg.discovery_mode.dropoff_multiplier)
-                logit_shift = float(users.cfg.discovery_mode.conversion_logit_shift)
-
-            proc = self._sessions.spawn(
-                user_id=user_id,
-                session_id=session_id,
-                intent_source=getattr(intent, "intent_source", None),
-                channel=getattr(intent, "channel", None),
-                conversion=conversion,
-                user_propensity=propensity,
-                dropoff_multiplier=drop_mult,
-                conversion_logit_shift=logit_shift,
-            )
-            yield proc
-
-            end_ts = self._sessions.graph.get_current_time()
-            # Ensure Pylance sees datetime, not Unknown
-            if not isinstance(end_ts, datetime):
-                end_ts = intent.ts_utc
-            users.mark_session_end(user_id=user_id, now_utc=end_ts)
-
-    session_runner: Any = (
-        RealSessionRunner(env, sessions_svc) if sessions_svc is not None else NoopSessionRunner(env)
-    )
-
-    # ----- intent resolver -----
-    resolver_cfg = IntentResolverConfig(
-        enabled=getattr(getattr(cfg, "intent_resolver", None), "enabled", True)
-    )
-    resolver = IntentResolverService(
-        env=env,
-        cfg=resolver_cfg,
-        ids=ids,  # Intent resolver expects ids.new_id(prefix) -> your IdsService supports next_id(prefix)
-        rng=rng,  # pass real RNG to satisfy its RngLike
-        intents=session_intents,
-        users=users,
-        session_runner=session_runner,
-        sink=sink,  # sink signature matches EventSink
-    )
-    resolver.start()
-
-    # ----- baseline arrivals -----
-    class ClockGraph:
-        def __init__(self, env_: simpy.Environment, start_: datetime) -> None:
-            self.env = env_
-            self.start_dt = start_
-
-        def get_current_time(self) -> datetime:
-            return self.start_dt + timedelta(seconds=float(self.env.now))
-
-    a_raw = raw.get("arrivals") if isinstance(raw.get("arrivals"), dict) else None
-    if isinstance(a_raw, dict):
-        b_raw = a_raw.get("baseline_arrivals") or a_raw.get("baseline_intents")
-        if isinstance(b_raw, dict):
-            curve_raw = b_raw.get("intraday_curve", {}) or {}
-            arrivals = ArrivalsService(
-                run_id=ctx.run_id,
-                rng=rng,
-                ids=ids,
-                graph=ClockGraph(env, start_dt_utc),
-                intent_bus=intent_bus,
-                baseline_arrivals=BaselineArrivalsConfig(
-                    model=str(b_raw.get("model", "nhpp")),
-                    daily_expected_intents=float(b_raw.get("daily_expected_intents", 0.0)),
-                    intraday_curve=GaussianPeakCurveConfig(
-                        peak_hour=float(curve_raw.get("peak_hour", 12.0)),
-                        spread_hours=float(curve_raw.get("spread_hours", 3.0)),
-                        floor=float(curve_raw.get("floor", 0.05)),
-                    ),
-                ),
-                num_days=int(cfg.run.num_days),
-                events=None,  # optional; avoids EventSink protocol mismatch
-            )
-            arrivals.start(env)
-
-    # ----- run lifecycle -----
-    try:
-        persistence.emit(
-            Event(
-                run_id=ctx.run_id,
-                event_id=ids.next_id("evt"),
-                ts_utc=start_dt_utc,
-                sim_time_s=float(env.now),
-                event_type="run_started",
-            )
-        )
+        # ----- run lifecycle -----
+        events.emit("run_started")
 
         horizon_s = int(cfg.run.num_days) * 86400
         logger.info("starting sim", extra={"run_id": ctx.run_id, "until_s": horizon_s})
         env.run(until=horizon_s)
 
-        end_ts = start_dt_utc + timedelta(seconds=horizon_s)
-        persistence.emit(
-            Event(
-                run_id=ctx.run_id,
-                event_id=ids.next_id("evt"),
-                ts_utc=end_ts,
-                sim_time_s=float(env.now),
-                event_type="run_finished",
-            )
-        )
+        events.emit("run_finished")
         persistence.flush(reason="bootstrap_finish")
     finally:
         persistence.close()

@@ -6,6 +6,7 @@ import pytest
 import simpy
 
 from sim.core.rng import RNG
+from sim.features.site_graph.types import WebsiteGraph
 
 UTC = UTC
 rng = RNG(seed=123)
@@ -20,8 +21,6 @@ class DummySink:
 
 
 def make_graph(env: simpy.Environment):
-    from sim.features.site_graph.service import WebsiteGraph
-
     return WebsiteGraph(env=env, rng=rng, pages={}, start_dt=datetime(2026, 1, 1, tzinfo=UTC))
 
 
@@ -37,18 +36,17 @@ def test_emit_persists_row_and_ids():
 
     env.run(until=12.0)
 
-    evt = svc.emit(
-        event_type="session_start",
+    svc.emit(
+        "session_start",
         user_id="u1",
         session_id="s1",
         channel="direct",
         payload={"foo": "bar"},
     )
 
-    assert evt.event_id == "run_x_00000001"
     assert len(sink.rows) == 1
-
     row = sink.rows[0]
+    assert row["event_id"] == "run_x_00000001"
     assert row["run_id"] == "run_x"
     assert row["event_type"] == "session_start"
     assert row["user_id"] == "u1"
@@ -70,7 +68,7 @@ def test_invalid_event_type_raises():
     svc = EventService(env=env, graph=graph, persistence=sink, ids=ids, run_id="run_x")
 
     with pytest.raises(ValueError):
-        svc.emit(event_type="user_created", user_id="u1")
+        svc.emit("not_a_real_event", user_id="u1")
 
 
 def test_session_events_require_session_id():
@@ -83,7 +81,7 @@ def test_session_events_require_session_id():
     svc = EventService(env=env, graph=graph, persistence=sink, ids=ids, run_id="run_x")
 
     with pytest.raises(ValueError):
-        svc.emit(event_type="page_view", user_id="u1", page="home", channel="direct")
+        svc.emit("page_view", user_id="u1", page="home", channel="direct")
 
 
 def test_channel_required_when_session_id_set():
@@ -96,7 +94,7 @@ def test_channel_required_when_session_id_set():
     svc = EventService(env=env, graph=graph, persistence=sink, ids=ids, run_id="run_x")
 
     with pytest.raises(ValueError):
-        svc.emit(event_type="session_start", user_id="u1", session_id="s1", channel=None)
+        svc.emit("session_start", user_id="u1", session_id="s1", channel=None)
 
 
 def test_payload_json_is_stable():
@@ -109,7 +107,7 @@ def test_payload_json_is_stable():
     svc = EventService(env=env, graph=graph, persistence=sink, ids=ids, run_id="run_x")
 
     svc.emit(
-        event_type="session_end",
+        "session_end",
         user_id="u1",
         session_id="s1",
         channel="direct",
@@ -129,10 +127,10 @@ def test_deterministic_ids_increment():
     ids = CounterEventIdGenerator(run_id="run_det")
     svc = EventService(env=env, graph=graph, persistence=sink, ids=ids, run_id="run_det")
 
-    svc.emit(event_type="session_start", user_id="u1", session_id="s1", channel="search")
-    svc.emit(event_type="page_view", user_id="u1", session_id="s1", channel="search", page="home")
+    svc.emit("session_start", user_id="u1", session_id="s1", channel="search")
+    svc.emit("page_view", user_id="u1", session_id="s1", channel="search", page="home")
     svc.emit(
-        event_type="session_end",
+        "session_end",
         user_id="u1",
         session_id="s1",
         channel="search",

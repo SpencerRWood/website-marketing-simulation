@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Protocol
 
-
-class RNGLike(Protocol):
-    def random(self) -> float: ...
+from sim.core.rng import RNG
 
 
 @dataclass(frozen=True)
@@ -58,7 +55,7 @@ class ConversionService:
         return 0.0 if prob < 0.0 else 1.0 if prob > 1.0 else prob
 
     def should_convert(
-        self, *, propensity: float, logit_shift: float = 0.0, rng: RNGLike
+        self, *, propensity: float, logit_shift: float = 0.0, rng: RNG
     ) -> tuple[bool, float]:
         prob = self.probability(propensity=propensity, logit_shift=logit_shift)
         u = float(rng.random())

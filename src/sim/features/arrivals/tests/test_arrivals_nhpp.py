@@ -10,7 +10,7 @@ from sim.features.arrivals.models.nhpp import (
     NHPPBaselineArrivalsConfig,
     NHPPBaselineArrivalsModel,
 )
-from sim.features.arrivals.types import SessionIntent
+from sim.features.session_intent.types import SessionIntent
 
 
 class DummyIds:
