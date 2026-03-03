@@ -162,7 +162,7 @@ class NHPPBaselineArrivalsModel(ArrivalModel):
 
                     ts = _assert_utc(self.graph.get_current_time())
                     intent = SessionIntent(
-                        intent_id=str(self.ids.new_id("intent")),
+                        intent_id=str(self.ids.next_id("intent")),
                         ts_utc=ts,
                         sim_time_s=float(env.now),
                         intent_source="baseline",

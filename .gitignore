@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 src/data/*
+src/notebooks/*
+
+prof.out
 
 # C extensions
 *.so

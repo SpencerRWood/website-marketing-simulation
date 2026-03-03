@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -114,8 +115,8 @@ class EventService(EventsEmitter):
 
         self._persistence.append(event.as_row())
 
-        if self._logger is not None:
-            self._logger.info(
+        if self._logger is not None and self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug(
                 "event_emitted",
                 extra={
                     "run_id": event.run_id,
