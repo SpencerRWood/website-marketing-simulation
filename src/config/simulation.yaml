@@ -6,7 +6,7 @@ run:
   run_id: "auto"           # If "auto", generated at runtime. Attached to all outputs.
   seed: 123                # Master RNG seed (guarantees deterministic runs).
   start_date: "2026-01-01" # Simulation start date (UTC).
-  num_days: 30             # Number of simulated calendar days.
+  num_days: 7             # Number of simulated calendar days.
 
 # ============================================================
 # Infrastructure (Cold Layer + Logging)
@@ -16,8 +16,8 @@ storage:
   duckdb_path: "data/sim.duckdb"  # Cold storage sink.
   clean_slate: true               # If true, database is recreated per run.
   flush:
-    every_n_events: 5000
-    or_every_seconds: 30
+    every_n_events: 100000
+    or_every_seconds: 600
 
 logging:
   level: "INFO"  # Structured logging level.

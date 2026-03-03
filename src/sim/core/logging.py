@@ -2,9 +2,32 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
 from datetime import UTC, datetime
 from typing import Any
+
+# Standard LogRecord attributes we don't want to re-emit as "extras"
+_RESERVED = {
+    "name",
+    "msg",
+    "args",
+    "levelname",
+    "levelno",
+    "pathname",
+    "filename",
+    "module",
+    "exc_info",
+    "exc_text",
+    "stack_info",
+    "lineno",
+    "funcName",
+    "created",
+    "msecs",
+    "relativeCreated",
+    "thread",
+    "threadName",
+    "processName",
+    "process",
+}
 
 
 class JsonFormatter(logging.Formatter):
@@ -15,10 +38,18 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "msg": record.getMessage(),
         }
-        # attach extra fields if present
-        for key in ("run_id", "feature", "event_type"):
-            if hasattr(record, key):
-                payload[key] = getattr(record, key)
+
+        # Merge extras: anything on record.__dict__ that's not reserved
+        for k, v in record.__dict__.items():
+            if k in _RESERVED:
+                continue
+            if k.startswith("_"):
+                continue
+            # don't overwrite core keys
+            if k in payload:
+                continue
+            payload[k] = v
+
         return json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
 
 
@@ -28,8 +59,10 @@ def get_logger(name: str, level: str = "INFO") -> logging.Logger:
         return logger  # avoid double handlers in tests
 
     logger.setLevel(level.upper())
-    handler = logging.StreamHandler(sys.stdout)
+
+    handler = logging.FileHandler("data/sim.log")
     handler.setFormatter(JsonFormatter())
+
     logger.addHandler(handler)
     logger.propagate = False
     return logger

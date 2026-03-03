@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -56,6 +57,30 @@ def _build_graph(
     return sg_factory.build(env=env, cfg_site_graph=cfg_site, start_dt=start_dt_utc, rng=rng)
 
 
+def _daily_progress_line(env: simpy.Environment, horizon_s: float, *, label: str = "SIM"):
+    day_s = 24 * 60 * 60
+    total_days = max(1, int(round(horizon_s / day_s)))
+
+    while True:
+        day_idx = min(total_days, int(float(env.now) // day_s) + 1)  # 1..total_days
+        pct = (float(env.now) / horizon_s) * 100 if horizon_s > 0 else 100.0
+
+        msg = f"\r[{label}] day {day_idx:>3}/{total_days}  ({pct:6.2f}%)"
+        sys.stdout.write(msg)
+        sys.stdout.flush()
+
+        if env.now >= horizon_s:
+            break
+
+        # Jump to next simulated day boundary
+        next_boundary = (int(float(env.now) // day_s) + 1) * day_s
+        yield env.timeout(max(0.0, next_boundary - float(env.now)))
+
+    # Finish the line cleanly
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
 def _parse_users_config(raw: dict[str, Any]) -> UsersConfig:
     u_raw = raw.get("users") or {}
 
@@ -110,6 +135,14 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
         adapter=adapter,
         every_n_events=cfg.storage.flush.every_n_events,
         or_every_seconds=cfg.storage.flush.or_every_seconds,
+    )
+    # REMOVE
+    print(
+        f"[FLUSH CONFIG] every_n_events={cfg.storage.flush.every_n_events} "
+        f"or_every_seconds={cfg.storage.flush.or_every_seconds}"
+    )
+    print(
+        f"[PERSISTENCE] every_n_events={persistence.every_n_events} or_every_seconds={persistence.or_every_seconds}"
     )
     persistence.open()
     persistence.start_periodic_flush(env)
@@ -339,7 +372,16 @@ def bootstrap_run(cfg: SimulationConfig, config_path: str | None = None) -> Boot
                 "campaigns_enabled": bool(raw.get("campaigns", {}).get("enabled", False)),
             },
         )
+
+        # Terminal-only run markers
+        print(f"[SIMULATION STARTED] run_id={ctx.run_id}")
+
+        # Daily single-line progress (updates once per simulated day)
+        env.process(_daily_progress_line(env, float(horizon_s), label="SIM"))
+
         env.run(until=horizon_s)
+
+        print(f"[SIMULATION ENDED] run_id={ctx.run_id}")
 
         events.emit("run_finished")
         persistence.flush(reason="bootstrap_finish")
