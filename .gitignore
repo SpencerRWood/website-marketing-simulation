@@ -5,6 +5,8 @@ __pycache__/
 src/data/*
 src/notebooks/*
 
+prof.out
+
 # C extensions
 *.so
 
