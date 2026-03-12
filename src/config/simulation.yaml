@@ -16,7 +16,7 @@ storage:
   duckdb_path: "data/sim.duckdb"  # Cold storage sink.
   clean_slate: true               # If true, database is recreated per run.
   flush:
-    every_n_events: 100000
+    every_n_events: 250000
     or_every_seconds: 600
 
 logging:
